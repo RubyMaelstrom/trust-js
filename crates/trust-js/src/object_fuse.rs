@@ -79,6 +79,23 @@ pub(crate) struct GuardData {
 }
 
 /// The constant properties of one object (see the module's documentation).
+///
+/// A property's state is read without a lock ([`ObjectFuse::state`]): a couple of loads, which
+/// the hot paths that ask "may this slot be stored in line" take (F4 part 2). The lock orders the
+/// transitions (a state moving, the generation, a buffer growing). The read is sound because:
+/// - every state word is an atomic, written only under the lock;
+/// - a state buffer is published (`words`, Release) only after its words are written, and a
+///   reader loads the address with Acquire and reads no word past the count the buffer's own
+///   word 0 holds;
+/// - no buffer the fuse published is freed while it lives (`buffers` keeps them), so an address
+///   a reader loaded stays in bounds, whatever another thread does meanwhile.
+///
+/// A fuse's states are written on the thread of its object's Agent (the object's writes and the
+/// fills of its caches run there), so a read there sees the current state. The optimizing tier's
+/// compile thread reads no state: the snapshot and the install run on the engine's thread. A
+/// reader on another thread would see a state that was current at some point: memory-safe, and,
+/// since a state only moves Untracked -> Constant -> NotConstant while its property lives, never
+/// ahead of the truth.
 pub(crate) struct ObjectFuse {
     /// 1 once a Constant property became NotConstant or the generation was bumped (SpiderMonkey's
     /// invalidatedConstantProperty_): while it is 0, a guard needs nothing else. Generated code
@@ -86,14 +103,22 @@ pub(crate) struct ObjectFuse {
     invalidated: AtomicU32,
     /// Bumped by the removal of a tracked property; [`GENERATION_INVALID`] once saturated.
     generation: AtomicU32,
-    /// The state words (two bits a slot), written under the lock; their buffer's address is
-    /// published in `words` for generated code, which reads a site's word there. The length never
-    /// shrinks: a site's word, in range when it compiled, stays in range.
-    states: Mutex<Vec<u32>>,
-    words: AtomicPtr<u32>,
+    /// The lock of transitions, and every state buffer the fuse published, the current one last
+    /// (see the type's documentation). A buffer's word 0 counts the state words after it, each
+    /// holding sixteen properties' two bits; it grows by doubling, so the retired buffers hold
+    /// fewer words than the current one.
+    buffers: Mutex<Vec<Box<[AtomicU32]>>>,
+    /// The current buffer's address ([`NO_STATES`] until a property is tracked), which generated
+    /// code reads a site's word through (`jit::string_calls`, the word index its
+    /// [`GuardData::index`] names). A buffer never shrinks: a site's word, in range when it
+    /// compiled, stays in range.
+    words: AtomicPtr<AtomicU32>,
     /// The fused object's map, the registry's key.
     props: usize,
 }
+
+/// The state buffer of a fuse that tracks no property yet: a count of 0 words, never written.
+static NO_STATES: AtomicU32 = AtomicU32::new(0);
 
 impl ObjectFuse {
     /// The offset of `invalidated`, the word generated code tests first.
@@ -110,22 +135,33 @@ impl ObjectFuse {
         let fuse = Arc::new(Self {
             invalidated: AtomicU32::new(0),
             generation: AtomicU32::new(0),
-            states: Mutex::new(Vec::new()),
-            words: AtomicPtr::new(std::ptr::null_mut()),
+            buffers: Mutex::new(Vec::new()),
+            words: AtomicPtr::new(std::ptr::from_ref(&NO_STATES).cast_mut()),
             props,
         });
         registry_insert(props, &fuse);
         fuse
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<u32>> {
-        self.states.lock().unwrap_or_else(|e| e.into_inner())
+    /// The lock of transitions (see the type's documentation).
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Box<[AtomicU32]>>> {
+        self.buffers.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn state_in(states: &[u32], slot: usize) -> PropertyState {
-        let Some(word) = states.get(slot / PROPS_PER_WORD) else {
+    /// The state of the property at `slot`, read without the lock: the published buffer's
+    /// address, its count and the slot's word (see the type's documentation).
+    #[inline]
+    pub(crate) fn state(&self, slot: usize) -> PropertyState {
+        let words = self.words.load(Ordering::Acquire);
+        let index = slot / PROPS_PER_WORD;
+        // SAFETY: `words` is NO_STATES or a buffer this fuse published after writing it, which
+        // stays allocated while the fuse lives; its word 0 counts the words after it.
+        let count = unsafe { (*words).load(Ordering::Relaxed) } as usize;
+        if index >= count {
             return PropertyState::Untracked;
-        };
+        }
+        // SAFETY: as above, and `1 + index` is within the buffer's `1 + count` words.
+        let word = unsafe { (*words.add(1 + index)).load(Ordering::Relaxed) };
         match (word >> shift(slot)) & STATE_MASK {
             0 => PropertyState::Untracked,
             1 => PropertyState::Constant,
@@ -133,23 +169,96 @@ impl ObjectFuse {
         }
     }
 
-    fn set_state_in(&self, states: &mut Vec<u32>, slot: usize, state: PropertyState) {
+    /// Set the state of the property at `slot`, under the lock (`buffers` is its guard's): a
+    /// slot past the buffer's words takes a buffer twice as large, published once its words are
+    /// written, the old one kept.
+    fn set_state(&self, buffers: &mut Vec<Box<[AtomicU32]>>, slot: usize, state: PropertyState) {
         let index = slot / PROPS_PER_WORD;
-        if index >= states.len() {
+        let mut words = self.words.load(Ordering::Relaxed);
+        // SAFETY: as in `state`; under the lock no other buffer is published meanwhile.
+        let count = unsafe { (*words).load(Ordering::Relaxed) } as usize;
+        if index >= count {
             if state == PropertyState::Untracked {
                 return;
             }
-            states.resize(index + 1, 0);
-            self.words.store(states.as_mut_ptr(), Ordering::Release);
+            let grown = (index + 1).max(2 * count).max(4);
+            let old = words;
+            buffers.push(
+                (0..=grown)
+                    .map(|at| {
+                        AtomicU32::new(match at {
+                            0 => grown as u32,
+                            // SAFETY: the old buffer's words 1..=count.
+                            at if at <= count => unsafe { (*old.add(at)).load(Ordering::Relaxed) },
+                            _ => 0,
+                        })
+                    })
+                    .collect(),
+            );
+            words = buffers
+                .last()
+                .expect("the buffer just made")
+                .as_ptr()
+                .cast_mut();
+            self.words.store(words, Ordering::Release);
         }
+        // SAFETY: `words` is this fuse's current buffer, `1 + index` within its words.
+        let cell = unsafe { &*words.add(1 + index) };
         let shift = shift(slot);
-        states[index] = (states[index] & !(STATE_MASK << shift)) | ((state as u32) << shift);
+        cell.store(
+            (cell.load(Ordering::Relaxed) & !(STATE_MASK << shift)) | ((state as u32) << shift),
+            Ordering::Relaxed,
+        );
     }
 
-    /// The state of the property at `slot` (tests).
+    /// How many state buffers the fuse has published, every one kept (tests).
     #[cfg(test)]
-    pub(crate) fn state(&self, slot: usize) -> PropertyState {
-        Self::state_in(&self.lock(), slot)
+    pub(crate) fn published_buffers(&self) -> usize {
+        self.lock().len()
+    }
+
+    /// The number of slots the current buffer holds states for.
+    fn tracked_len(&self) -> usize {
+        // SAFETY: as in `state`.
+        let count = unsafe { (*self.words.load(Ordering::Acquire)).load(Ordering::Relaxed) };
+        count as usize * PROPS_PER_WORD
+    }
+
+    /// Whether a cache may let generated code or the VM store to the property at `slot` without
+    /// reporting the write (SpiderMonkey's canOptimizeSetSlot, vm/ObjectFuse.h:222-224, which
+    /// attaches SetProp stubs only for NotConstant properties): only a NotConstant property's
+    /// value is relied on by no compile, now or later, since NotConstant is terminal while the
+    /// property lives and a removal gives its map a fresh shape, which every cache proves. A
+    /// refused store reports its write, which moves the property on (Untracked -> Constant ->
+    /// NotConstant), so a property stored in a loop reaches the in-line store at its third
+    /// store at the latest.
+    #[inline]
+    pub(crate) fn may_store_in_line(&self, slot: usize) -> bool {
+        self.state(slot) == PropertyState::NotConstant
+    }
+
+    /// A script's lexical declaration shadows the property at `slot` (SpiderMonkey's
+    /// handleShadowedGlobalProperty, vm/ObjectFuse.cpp:182-191): a read of the name no longer
+    /// reaches the property, so a tracked property's guards fail. The state is kept.
+    pub(crate) fn handle_shadowed(&self, slot: usize) {
+        if self.state(slot) != PropertyState::Untracked {
+            let _transition = self.lock();
+            self.bump_generation();
+        }
+    }
+
+    /// Every property may have changed (the map replaced whole, or the object no longer
+    /// ordinary): a Constant property becomes NotConstant and the generation moves
+    /// (SpiderMonkey's invalidateAllDependentIonScripts with a generation bump, as its
+    /// handleGlobalLexicalMutation, vm/ObjectFuse.cpp:177-180).
+    pub(crate) fn handle_all_changed(&self) {
+        let mut buffers = self.lock();
+        for slot in 0..self.tracked_len() {
+            if self.state(slot) == PropertyState::Constant {
+                self.set_state(&mut buffers, slot, PropertyState::NotConstant);
+            }
+        }
+        self.bump_generation();
     }
 
     /// Whether a guard's fast path holds: no Constant property was invalidated and the generation
@@ -164,6 +273,7 @@ impl ObjectFuse {
         self.generation.load(Ordering::Relaxed)
     }
 
+    /// Under the lock.
     fn bump_generation(&self) {
         self.invalidated.store(1, Ordering::Relaxed);
         let generation = self.generation.load(Ordering::Relaxed);
@@ -181,17 +291,16 @@ impl ObjectFuse {
         if generation == GENERATION_INVALID {
             return None;
         }
-        let mut states = self.lock();
-        match Self::state_in(&states, slot) {
-            PropertyState::Untracked => {
-                self.set_state_in(&mut states, slot, PropertyState::Constant)
-            }
+        let mut buffers = self.lock();
+        match self.state(slot) {
+            PropertyState::Untracked => self.set_state(&mut buffers, slot, PropertyState::Constant),
             PropertyState::Constant => {}
             PropertyState::NotConstant => return None,
         }
         Some(GuardData {
             generation,
-            index: (slot / PROPS_PER_WORD) as u32,
+            // The word's index in the published buffer, past its count.
+            index: (1 + slot / PROPS_PER_WORD) as u32,
             mask: 0b10 << shift(slot),
         })
     }
@@ -207,26 +316,29 @@ impl ObjectFuse {
         if self.generation() != data.generation || data.generation == GENERATION_INVALID {
             return false;
         }
-        let states = self.lock();
-        states
-            .get(data.index as usize)
-            .is_some_and(|word| word & data.mask == 0)
+        let words = self.words.load(Ordering::Acquire);
+        // SAFETY: as in `state`; a site's index is within the buffer it was recorded under,
+        // which never shrinks.
+        unsafe { (*words.add(data.index as usize)).load(Ordering::Relaxed) & data.mask == 0 }
     }
 
     /// A write of the value at `slot`, or a define there that is not redundant (SpiderMonkey's
-    /// handlePropertyValueChange).
-    pub(crate) fn handle_value_change(&self, slot: usize) {
-        let mut states = self.lock();
-        match Self::state_in(&states, slot) {
-            PropertyState::Untracked => {
-                self.set_state_in(&mut states, slot, PropertyState::Constant)
-            }
+    /// handlePropertyValueChange). A NotConstant property, which no write moves, takes no lock.
+    pub(crate) fn handle_value_change(&self, slot: usize) -> PropertyState {
+        if self.state(slot) == PropertyState::NotConstant {
+            return PropertyState::NotConstant;
+        }
+        let mut buffers = self.lock();
+        let state = self.state(slot);
+        match state {
+            PropertyState::Untracked => self.set_state(&mut buffers, slot, PropertyState::Constant),
             PropertyState::Constant => {
                 self.invalidated.store(1, Ordering::Relaxed);
-                self.set_state_in(&mut states, slot, PropertyState::NotConstant);
+                self.set_state(&mut buffers, slot, PropertyState::NotConstant);
             }
             PropertyState::NotConstant => {}
         }
+        state
     }
 
     /// The property at `slot` is removed, the map's later slots moving down one (SpiderMonkey's
@@ -234,35 +346,73 @@ impl ObjectFuse {
     /// tracked property, or one before a tracked property, whose slot changes, bumps the
     /// generation.
     pub(crate) fn handle_remove(&self, slot: usize) {
-        let mut states = self.lock();
-        let len = states.len() * PROPS_PER_WORD;
-        if (slot..len).any(|at| Self::state_in(&states, at) != PropertyState::Untracked) {
+        let mut buffers = self.lock();
+        let len = self.tracked_len();
+        if (slot..len).any(|at| self.state(at) != PropertyState::Untracked) {
             self.bump_generation();
         }
         for at in slot..len.saturating_sub(1) {
-            let next = Self::state_in(&states, at + 1);
-            self.set_state_in(&mut states, at, next);
+            let next = self.state(at + 1);
+            self.set_state(&mut buffers, at, next);
         }
         if len != 0 {
-            self.set_state_in(&mut states, len - 1, PropertyState::Untracked);
+            self.set_state(&mut buffers, len - 1, PropertyState::Untracked);
         }
     }
 
     /// Every property is removed (`Props::clear`, which only tests call).
     #[cfg(test)]
     pub(crate) fn handle_clear(&self) {
-        let mut states = self.lock();
-        if states.iter().any(|&word| word != 0) {
+        let mut buffers = self.lock();
+        let len = self.tracked_len();
+        if (0..len).any(|at| self.state(at) != PropertyState::Untracked) {
             self.bump_generation();
         }
-        states.iter_mut().for_each(|word| *word = 0);
+        for at in 0..len {
+            self.set_state(&mut buffers, at, PropertyState::Untracked);
+        }
     }
 }
 
 impl Drop for ObjectFuse {
     fn drop(&mut self) {
         registry_remove(self.props, self);
+        // The fuse drops on its realm's thread (its holders, RealmFuses in an Interp, stay there).
+        let _ = ACTIVE_GLOBAL.try_with(|active| {
+            if std::ptr::eq(active.get().1, self) {
+                active.set((0, std::ptr::null()));
+            }
+        });
     }
+}
+
+thread_local! {
+    /// The global fuse of the realm active on this thread (`Interp::set_realm_fuses`) and its
+    /// map's address: how a watched global's reported write finds its fuse with no registry and
+    /// no lock (F4 part 2). Cleared as that fuse drops, on this thread (see `Drop`).
+    static ACTIVE_GLOBAL: Cell<(usize, *const ObjectFuse)> =
+        const { Cell::new((0, std::ptr::null())) };
+}
+
+/// Make `fuse` the active realm's global fuse on this thread (`Interp::set_realm_fuses`).
+pub(crate) fn set_active_global(fuse: Option<&Arc<ObjectFuse>>) {
+    ACTIVE_GLOBAL.set(fuse.map_or((0, std::ptr::null()), |fuse| {
+        (fuse.props, Arc::as_ptr(fuse))
+    }));
+}
+
+/// The map address of this thread's active global fuse, 0 for none (tests).
+#[cfg(test)]
+pub(crate) fn active_global_props() -> usize {
+    ACTIVE_GLOBAL.get().0
+}
+
+/// The fuse of the watched map at `props` when it is the active realm's global on this thread.
+#[inline]
+fn active_global_for(props: usize) -> Option<&'static ObjectFuse> {
+    let (active, fuse) = ACTIVE_GLOBAL.get();
+    // SAFETY: the pointer names a live fuse: it is cleared before that fuse drops.
+    (active == props && !fuse.is_null()).then(|| unsafe { &*fuse })
 }
 
 fn shift(slot: usize) -> u32 {
@@ -317,6 +467,19 @@ fn registry_remove(props: usize, fuse: &ObjectFuse) {
     }
 }
 
+/// A realm's fuses, held by the realm (`Interp::realm_fuses` and its record in `Interp::realms`):
+/// String.prototype's and, once its built-ins are installed, the global object's (F4 part 2).
+pub(crate) struct RealmFuses {
+    pub(crate) string_proto: Option<Arc<ObjectFuse>>,
+    pub(crate) global: Option<Arc<ObjectFuse>>,
+}
+
+/// The fuse registered for the map at `props`, if it lives (tests).
+#[cfg(test)]
+pub(crate) fn fuse_for(props: usize) -> Option<Arc<ObjectFuse>> {
+    fuse_of(props)
+}
+
 fn fuse_of(props: usize) -> Option<Arc<ObjectFuse>> {
     registry()
         .lock()
@@ -366,6 +529,128 @@ pub(crate) fn note_value_change(props: usize, slot: usize) {
 fn value_change_slow(props: usize, slot: usize) {
     if let Some(fuse) = fuse_of(props) {
         fuse.handle_value_change(slot);
+    }
+}
+
+/// The census of a watched global's reported writes (F4 part 2, R-4): value writes that reached
+/// Rust (each a checked store: an in-line store reports nothing), those that made a Constant
+/// property NotConstant, and of these the ones that stored the value it held (a2: the evidence
+/// for V8's same-value rule); printed at exit under TRUST_JS_OPT_LOG ([`global_census_dump`]).
+static GLOBAL_CHECKED_STORES: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_CHANGED_CONSTANTS: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_SAME_VALUE_CHANGES: AtomicU64 = AtomicU64::new(0);
+/// Fills of writing caches the rule refused (R2), and of these the Reference hints (a script's
+/// top-level assignment of a global that is not yet NotConstant takes the checked path).
+static GLOBAL_REFUSED_FILLS: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_REFUSED_HINTS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+thread_local! {
+    /// This thread's watched-global value writes that reached Rust (tests).
+    pub(crate) static TEST_GLOBAL_CHECKED: Cell<u64> = const { Cell::new(0) };
+}
+
+/// A watched global's map at `props` wrote the value at `slot` (`Props::set_value`,
+/// `Props::set_value_at`): a value change, as [`note_value_change`]'s; `same` when the value
+/// stored is the one the slot held.
+#[inline]
+pub(crate) fn note_global_value_change(props: usize, slot: usize, same: bool) {
+    GLOBAL_CHECKED_STORES.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    TEST_GLOBAL_CHECKED.with(|count| count.set(count.get() + 1));
+    // The active realm's global: its fuse with no registry, and a NotConstant property with no
+    // lock (`ObjectFuse::handle_value_change`).
+    let state = match active_global_for(props) {
+        Some(fuse) => fuse.handle_value_change(slot),
+        None => registered_value_change(props, slot),
+    };
+    if state == PropertyState::Constant {
+        GLOBAL_CHANGED_CONSTANTS.fetch_add(1, Ordering::Relaxed);
+        if same {
+            GLOBAL_SAME_VALUE_CHANGES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn registered_value_change(props: usize, slot: usize) -> PropertyState {
+    match may_have_fuse(props).then(|| fuse_of(props)).flatten() {
+        Some(fuse) => fuse.handle_value_change(slot),
+        None => PropertyState::Untracked,
+    }
+}
+
+/// A watched global's map at `props` may have changed every property (its map replaced or
+/// taken, or the object no longer ordinary).
+pub(crate) fn note_all_changed(props: usize) {
+    if may_have_fuse(props) {
+        if let Some(fuse) = fuse_of(props) {
+            fuse.handle_all_changed();
+        }
+    }
+}
+
+/// A script's lexical declaration shadows the watched global's property at `slot`
+/// ([`ObjectFuse::handle_shadowed`]).
+pub(crate) fn note_shadowed(props: usize, slot: usize) {
+    if may_have_fuse(props) {
+        if let Some(fuse) = fuse_of(props) {
+            fuse.handle_shadowed(slot);
+        }
+    }
+}
+
+/// Whether a cache may store to the property at `slot` of the watched global whose map is at
+/// `props` without reporting ([`ObjectFuse::may_store_in_line`]): through `active`, the active
+/// realm's global fuse (`Interp::realm_fuses`), when it is that map's, with no registry and no
+/// lock; else through the registry (another realm's global, which a store reaches rarely);
+/// false where the map has no fuse, which a watched map always has while its realm lives.
+#[inline]
+pub(crate) fn global_may_store_in_line(
+    active: Option<&ObjectFuse>,
+    props: usize,
+    slot: usize,
+) -> bool {
+    let may = match active {
+        Some(fuse) if fuse.props == props => fuse.may_store_in_line(slot),
+        _ => registered_may_store_in_line(props, slot),
+    };
+    if !may {
+        GLOBAL_REFUSED_FILLS.fetch_add(1, Ordering::Relaxed);
+    }
+    may
+}
+
+#[cold]
+#[inline(never)]
+fn registered_may_store_in_line(props: usize, slot: usize) -> bool {
+    may_have_fuse(props) && fuse_of(props).is_some_and(|fuse| fuse.may_store_in_line(slot))
+}
+
+/// A Reference's hint refused by the rule (the census, [`global_census_dump`]).
+pub(crate) fn note_refused_hint() {
+    GLOBAL_REFUSED_HINTS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The state of the watched global's property at `slot`, Untracked where the map has no fuse.
+#[cfg(test)]
+pub(crate) fn global_property_state(props: usize, slot: usize) -> PropertyState {
+    fuse_of(props).map_or(PropertyState::Untracked, |fuse| fuse.state(slot))
+}
+
+/// Print the census of a watched global's writes under TRUST_JS_OPT_LOG (the shell's end of
+/// run, `trust_js::unstable_feedback_census_dump`).
+pub(crate) fn global_census_dump() {
+    if std::env::var_os("TRUST_JS_OPT_LOG").is_some() {
+        eprintln!(
+            "[opt] global stores: checked {}, constants changed {}, same value {}, fills refused {}, reference hints refused {}",
+            GLOBAL_CHECKED_STORES.load(Ordering::Relaxed),
+            GLOBAL_CHANGED_CONSTANTS.load(Ordering::Relaxed),
+            GLOBAL_SAME_VALUE_CHANGES.load(Ordering::Relaxed),
+            GLOBAL_REFUSED_FILLS.load(Ordering::Relaxed),
+            GLOBAL_REFUSED_HINTS.load(Ordering::Relaxed)
+        );
     }
 }
 
@@ -473,7 +758,7 @@ impl StringCallSite {
     /// the class will do: for a primitive String receiver and a Number index, the methods the
     /// classes name read nothing of their Realm. Whether the site now holds.
     pub(crate) fn fill(&self, interp: &crate::interpreter::Interp) -> bool {
-        let Some(fuse) = interp.string_proto_fuse.as_ref() else {
+        let Some(fuse) = interp.string_proto_fuse() else {
             return false;
         };
         let address = Arc::as_ptr(fuse) as usize;

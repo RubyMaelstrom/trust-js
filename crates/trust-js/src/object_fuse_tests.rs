@@ -26,8 +26,8 @@ fn engine(tier: Tier) -> Engine {
 fn fuse(engine: &Engine) -> Arc<ObjectFuse> {
     engine
         .interp
-        .string_proto_fuse
-        .clone()
+        .string_proto_fuse()
+        .cloned()
         .expect("String.prototype has a fuse")
 }
 
@@ -370,7 +370,12 @@ fn another_realms_string_prototype_has_its_own_fuse() {
             .interp
             .realms
             .get(&other_ptr.unwrap())
-            .and_then(|realm| realm.string_proto_fuse.clone())
+            .and_then(|realm| {
+                realm
+                    .realm_fuses
+                    .as_ref()
+                    .and_then(|fuses| fuses.string_proto.clone())
+            })
             .expect("the new Realm's fuse");
         assert!(!Arc::ptr_eq(&main, &other));
         let main_data = main
@@ -399,8 +404,7 @@ fn another_realms_string_prototype_has_its_own_fuse() {
         );
         assert!(engine
             .interp
-            .string_proto_fuse
-            .as_ref()
+            .string_proto_fuse()
             .is_some_and(|active| Arc::ptr_eq(active, &main)));
     }
 }
@@ -419,16 +423,15 @@ fn every_realm_switch_carries_the_string_prototypes_fuse() {
         .map(|g| crate::value::Gc::as_ptr(&g) as usize)
         .unwrap();
     let other = engine.interp.realms[&key]
-        .string_proto_fuse
-        .clone()
+        .string_proto_fuse()
+        .cloned()
         .expect("the new Realm's fuse");
     let other_proto = crate::value::Gc::as_ptr(&engine.interp.realms[&key].string_proto) as usize;
     let main_proto = crate::value::Gc::as_ptr(&engine.interp.string_proto) as usize;
     let active_is = |engine: &Engine, fuse: &Arc<ObjectFuse>, proto: usize| {
         engine
             .interp
-            .string_proto_fuse
-            .as_ref()
+            .string_proto_fuse()
             .is_some_and(|active| Arc::ptr_eq(active, fuse))
             && engine.interp.string_proto_fuse_ptr == Arc::as_ptr(fuse) as usize
             && crate::value::Gc::as_ptr(&engine.interp.string_proto) as usize == proto
@@ -440,8 +443,7 @@ fn every_realm_switch_carries_the_string_prototypes_fuse() {
     engine.interp.swap_realm(&mut saved);
     assert!(active_is(&engine, &main, main_proto), "left");
     assert!(saved
-        .string_proto_fuse
-        .as_ref()
+        .string_proto_fuse()
         .is_some_and(|fuse| Arc::ptr_eq(fuse, &other)));
     let mine = engine.interp.snapshot_realm();
     let theirs = engine.interp.realms[&key].snapshot_clone();
@@ -453,8 +455,7 @@ fn every_realm_switch_carries_the_string_prototypes_fuse() {
     engine.interp.restore_realm(&mine);
     assert!(active_is(&engine, &main, main_proto), "restored mine");
     assert!(engine.interp.realms[&key]
-        .string_proto_fuse
-        .as_ref()
+        .string_proto_fuse()
         .is_some_and(|fuse| Arc::ptr_eq(fuse, &other)));
 }
 

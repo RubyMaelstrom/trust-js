@@ -2969,6 +2969,10 @@ impl Object {
         if !plain && self.ic_plain() {
             // Generated code that relied on an ordinary object checks again (Props::slot_epoch).
             self.props.move_slot_epoch();
+            if self.props.entries.watched() {
+                // A watched global's properties stop being read as an ordinary object's.
+                self.props.note_fused_all_changed();
+            }
         }
         self.props.set_flag(FLAG_IC_PLAIN, plain);
     }
@@ -2982,19 +2986,34 @@ impl Object {
         self.props.set_flag(FLAG_CONSTRUCTOR, constructor);
     }
     /// A class constructor's kind ([`CLASS_BASE`] or [`CLASS_DERIVED`]; 0 for every other
-    /// object, see [`FLAG_CLASS_SHIFT`]).
+    /// object, see [`FLAG_CLASS_SHIFT`]), the watched global ([`CLASS_WATCHED`]) included.
     #[inline]
     pub(crate) fn class_kind(&self) -> u8 {
-        (self.props.entries.flags.get() & FLAG_CLASS_MASK) >> FLAG_CLASS_SHIFT
+        let kind = (self.props.entries.flags.get() & FLAG_CLASS_MASK) >> FLAG_CLASS_SHIFT;
+        if kind == CLASS_WATCHED {
+            0
+        } else {
+            kind
+        }
     }
     #[inline]
     pub(crate) fn set_class_kind(&self, kind: u8) {
         debug_assert!(kind <= CLASS_DERIVED);
+        debug_assert!(
+            !self.props.entries.watched(),
+            "the watched global is no class constructor"
+        );
         let flags = self.props.entries.flags.get() & !FLAG_CLASS_MASK;
         self.props
             .entries
             .flags
             .set(flags | (kind << FLAG_CLASS_SHIFT));
+    }
+    /// Whether this is a realm's global object whose properties' states its fuse keeps
+    /// ([`CLASS_WATCHED`]; tests).
+    #[cfg(test)]
+    pub(crate) fn watched_global(&self) -> bool {
+        self.props.entries.watched()
     }
 }
 
@@ -3002,6 +3021,19 @@ impl Object {
 pub(crate) const CLASS_BASE: u8 = 1;
 /// [`Object::class_kind`] of a derived class's constructor (`class C extends B`).
 pub(crate) const CLASS_DERIVED: u8 = 2;
+/// The class field's fourth value, which no class constructor takes (a global object is never
+/// one): a realm's global object, whose properties' states its ObjectFuse keeps so that the
+/// optimizing tier may read an unchanged property as a constant (F4 part 2;
+/// `crate::object_fuse`). It stays with the object across map replacements ([`OBJECT_FLAGS`]),
+/// [`Object::class_kind`] reads it as 0, and while it is set every write of a named slot reports
+/// to the fuse ([`FLAG_REPORTS`]) and every shape the map takes is a fresh serial
+/// ([`NamedEntries::set_shape`]).
+pub(crate) const CLASS_WATCHED: u8 = 3;
+/// The flag bits whose maps report their writes to a fuse, tested together by the write paths:
+/// [`FLAG_PROTO`] (a fused prototype's) and the class field's high bit, set for
+/// [`CLASS_WATCHED`] (and for a derived class constructor's own writes, which the cold path
+/// leaves at the fuses' filter).
+const FLAG_REPORTS: u8 = FLAG_PROTO | (CLASS_DERIVED << FLAG_CLASS_SHIFT);
 
 // An object cell owns nothing to release: its Rust-heap payloads (a Map's tables, a bound
 // function's arguments, an error's stack trace, a map's hash index...) sit in payload cells of
@@ -3056,11 +3088,21 @@ impl Object {
         // The words' remembered record described their old owner's marks.
         properties.elems.0.force_full();
         let cell = self.props.entries.cell as usize;
-        // The map takes this cell's capacity class (W2d step 3).
-        properties.entries.shape = rebased_shape(&properties.entries, class_for(cell));
+        // The map takes this cell's capacity class (W2d step 3), and a watched global's map a
+        // fresh shape of its own (`NamedEntries::set_shape`).
+        let shape = if properties.entries.watched() {
+            shape_fresh(class_for(cell))
+        } else {
+            rebased_shape(&properties.entries, class_for(cell))
+        };
+        properties.entries.set_shape(shape);
         let epoch = self.props.slot_epoch().max(properties.slot_epoch());
         properties.entries.epoch.set(epoch);
         properties.move_slot_epoch();
+        if properties.entries.watched() {
+            // Every slot was rewritten (F4 part 2, W8).
+            self.props.note_fused_all_changed();
+        }
         self.props = properties;
         // SAFETY: this Object's cell holds `cell` slots after its header.
         unsafe { self.props.entries.attach(cell) };
@@ -3073,7 +3115,12 @@ impl Object {
     pub(crate) fn take_props(&mut self) -> Props {
         let cell = self.props.entries.cell as usize;
         self.props.entries.detach();
-        let empty = Props::with_entries(NamedEntries {
+        let watched = self.props.entries.watched();
+        if watched {
+            // Every slot leaves (F4 part 2, W8).
+            self.props.note_fused_all_changed();
+        }
+        let mut empty = Props::with_entries(NamedEntries {
             shape: empty_shape(class_for(cell)),
             epoch: Cell::new(self.props.slot_epoch()),
             ..NamedEntries::default()
@@ -3083,7 +3130,16 @@ impl Object {
             .entries
             .flags
             .set(self.props.entries.flags.get() & OBJECT_FLAGS);
-        let taken = std::mem::replace(&mut self.props, empty);
+        if watched {
+            // A watched map's shape is its own, even empty (`NamedEntries::set_shape`).
+            empty.entries.set_shape(shape_fresh(class_for(cell)));
+        }
+        let mut taken = std::mem::replace(&mut self.props, empty);
+        if watched {
+            // The taken map is no object's yet and leaves the watched id behind: another map
+            // never takes one (R-1, U3).
+            taken.entries.unwatch();
+        }
         // SAFETY: this Object's cell holds `cell` slots after its header.
         unsafe { self.props.entries.attach(cell) };
         taken
@@ -3095,7 +3151,12 @@ impl Object {
     pub(crate) fn set_props_for_test(&mut self, mut props: Props) {
         debug_assert_eq!(props.entries.cell, 0, "a map outside a cell");
         let cell = self.props.entries.cell as usize;
-        props.entries.shape = rebased_shape(&props.entries, class_for(cell));
+        let shape = if props.entries.watched() {
+            shape_fresh(class_for(cell))
+        } else {
+            rebased_shape(&props.entries, class_for(cell))
+        };
+        props.entries.set_shape(shape);
         let epoch = self.props.slot_epoch().max(props.slot_epoch());
         props.entries.epoch.set(epoch);
         props.move_slot_epoch();
@@ -8010,14 +8071,89 @@ impl Default for NamedEntries {
     }
 }
 
+impl NamedEntries {
+    /// Whether this is the map of a watched global ([`CLASS_WATCHED`]).
+    #[inline]
+    fn watched(&self) -> bool {
+        self.flags.get() & FLAG_CLASS_MASK == FLAG_CLASS_MASK
+    }
+
+    /// A map that leaves a watched global (a copy, a taken map): no longer watched, and a shape
+    /// of its own keys reached through the transition table, never the watched id (R-1, U3).
+    fn unwatch(&mut self) {
+        if self.watched() {
+            self.flags.set(self.flags.get() & !FLAG_CLASS_MASK);
+            let shape = keyed_shape(self, self.class());
+            self.set_shape(shape);
+        }
+    }
+
+    /// Write the map's shape: every write goes through here (F4 part 2, R-1 U4). A watched map's
+    /// shape is unique to it for its life, since property caches prove a shape and not an
+    /// object: its every shape is a fresh serial minted for it (`shape_fresh`), no transition
+    /// table entry leads to one, and no other map takes one. Debug builds assert both halves.
+    #[inline]
+    fn set_shape(&mut self, shape: u32) {
+        #[cfg(debug_assertions)]
+        watched_shapes::check(self.watched(), shape);
+        self.shape = shape;
+    }
+}
+
+/// The debug net of [`NamedEntries::set_shape`]: the serial `shape_fresh` minted last on this
+/// thread, and every shape a watched map took.
+#[cfg(debug_assertions)]
+mod watched_shapes {
+    use std::cell::Cell;
+    use std::sync::{Mutex, OnceLock};
+
+    thread_local! {
+        pub(super) static LAST_FRESH: Cell<u32> = const { Cell::new(0) };
+    }
+
+    fn taken() -> &'static Mutex<std::collections::HashSet<u32>> {
+        static TAKEN: OnceLock<Mutex<std::collections::HashSet<u32>>> = OnceLock::new();
+        TAKEN.get_or_init(Default::default)
+    }
+
+    pub(super) fn check(watched: bool, shape: u32) {
+        if !super::is_cacheable_shape(shape) {
+            return;
+        }
+        let mut taken = taken().lock().unwrap_or_else(|e| e.into_inner());
+        if watched {
+            assert_eq!(
+                LAST_FRESH.with(Cell::get),
+                shape,
+                "a watched global's shape is a fresh serial minted for it"
+            );
+            taken.insert(shape);
+        } else {
+            assert!(
+                !taken.contains(&shape),
+                "a map took a shape a watched global holds or held"
+            );
+        }
+    }
+}
+
 /// A copy outside any cell, with every slot in its record (W2d step 3), the flag byte and the
-/// memos.
+/// memos. A copy of a watched global's map is not watched and has a shape of its own keys
+/// ([`NamedEntries::unwatch`]).
 impl Clone for NamedEntries {
     fn clone(&self) -> Self {
         let mut copy = NamedEntries {
             layout: self.layout.clone(),
-            shape: self.shape,
-            flags: Cell::new(self.flags.get()),
+            shape: if self.watched() {
+                keyed_shape(self, self.class())
+            } else {
+                self.shape
+            },
+            flags: Cell::new(if self.watched() {
+                self.flags.get() & !FLAG_CLASS_MASK
+            } else {
+                self.flags.get()
+            }),
             proto_slot: Cell::new(self.proto_slot.get()),
             len_slot: Cell::new(self.len_slot.get()),
             epoch: Cell::new(self.epoch.get()),
@@ -8796,6 +8932,34 @@ fn rebased_shape(entries: &NamedEntries, class: u32) -> u32 {
     rebased
 }
 
+/// The shape the same sequence of additions as `entries`' keys and attributes reaches from the
+/// empty shape of class `class`, through the transition table: [`rebased_shape`]'s walk with no
+/// same-class shortcut and no memo, for a map copied from a watched global, which never takes
+/// that map's own id (F4 part 2, R-1 U3).
+#[cold]
+#[inline(never)]
+fn keyed_shape(entries: &NamedEntries, class: u32) -> u32 {
+    let mut shape = empty_shape(class);
+    for (slot, &key) in entries.keys().iter().enumerate() {
+        shape = shape_transition(shape, key, entries.attrs(slot), None).0;
+        if !is_cacheable_shape(shape) {
+            break;
+        }
+    }
+    shape
+}
+
+/// The shape a copy of `source`'s keys and attributes takes in class `class`: [`rebased_shape`]
+/// (the source's own when the classes agree), or for a watched global's map [`keyed_shape`].
+#[inline]
+fn copied_shape(source: &NamedEntries, class: u32) -> u32 {
+    if source.watched() {
+        keyed_shape(source, class)
+    } else {
+        rebased_shape(source, class)
+    }
+}
+
 fn shape_layout(id: u32) -> Option<PropertyLayout> {
     with_active_gc_heap(|heap| heap.shapes.borrow().layouts.get(id).cloned())
 }
@@ -8803,7 +8967,10 @@ fn shape_layout(id: u32) -> Option<PropertyLayout> {
 /// A fresh unique shape id of capacity class `class` (a structural removal / deopt — no cache
 /// should still match).
 fn shape_fresh(class: u32) -> u32 {
-    with_active_gc_heap(|heap| heap.shapes.borrow_mut().fresh(class))
+    let shape = with_active_gc_heap(|heap| heap.shapes.borrow_mut().fresh(class));
+    #[cfg(debug_assertions)]
+    watched_shapes::LAST_FRESH.with(|last| last.set(shape));
+    shape
 }
 
 /// Entry count up to which a `Props` runs without a hash index (linear-scan lookups, no hash
@@ -9275,6 +9442,7 @@ impl Props {
         if self.entries.is_empty()
             && self.entries.index().is_none()
             && !self.elem_mode()
+            && !self.entries.watched()
             && source
                 .entries
                 .props()
@@ -9294,7 +9462,8 @@ impl Props {
             }
             // The source's shape, or across capacity classes the one its keys reach in this
             // map's class (W2d step 3).
-            self.entries.shape = rebased_shape(&source.entries, self.entries.class());
+            let shape = copied_shape(&source.entries, self.entries.class());
+            self.entries.set_shape(shape);
             self.entries.len_slot.set(source.entries.len_slot.get());
             self.entries.proto_slot.set(source.entries.proto_slot.get());
             self.ensure_fallback_index();
@@ -9516,7 +9685,7 @@ impl Props {
         // The layout lists ArrayCreate's `length` and then the named properties, with their
         // attributes: the slots take only their values.
         entries.layout = Some(layout);
-        entries.shape = shape;
+        entries.set_shape(shape);
         entries.extend_fresh(
             1 + named.len(),
             std::iter::once(PropWord::from_value(Value::Num(len as f64)))
@@ -9577,7 +9746,9 @@ impl Props {
         debug_assert!(entries.is_empty() && entries.layout.is_none());
         // The layout lists the keys with their attributes; the slots take only the values.
         entries.layout = template.entries.layout.clone();
-        entries.shape = template.entries.shape;
+        // A template is no global's map (the U4 net checks the shape too).
+        debug_assert!(!template.entries.watched(), "a template is no global's map");
+        entries.set_shape(template.entries.shape);
         entries.copy_record_parts_from(&template.entries);
         entries.extend_fresh(values.len(), values.map(PropWord::from_value));
         // The template's map bits; the object's own.
@@ -9612,7 +9783,8 @@ impl Props {
             {
                 let entries = &mut self.entries;
                 entries.layout = source.layout.clone();
-                entries.shape = source.shape;
+                debug_assert!(!source.watched(), "a template is no global's map");
+                entries.set_shape(source.shape);
                 // SAFETY: the record's block holds its `len` initialized slot words after its
                 // header, and this map's cell has room for `cell` words after the object's.
                 unsafe {
@@ -9642,7 +9814,8 @@ impl Props {
         let source = &template.entries;
         let entries = &mut self.entries;
         entries.layout = source.layout.clone();
-        entries.shape = source.shape;
+        debug_assert!(!source.watched(), "a template is no global's map");
+        entries.set_shape(source.shape);
         entries.copy_record_parts_from(source);
         entries.extend_fresh(
             source.len(),
@@ -9931,7 +10104,32 @@ impl Props {
     /// are, so that the write paths keep one flag test.
     #[cold]
     #[inline(never)]
-    fn note_fused_value_write(&self, slot: usize) {
+    fn note_fused_value_write(&self, slot: usize, v: Value) {
+        if self
+            .entries
+            .keys()
+            .get(slot)
+            .is_some_and(|key| key.as_index().is_none())
+        {
+            if self.entries.watched() {
+                // The census counts a store of the value the slot holds (F4 part 2, a2).
+                let same = self.entries.slot(slot).0.get() == v.0;
+                crate::object_fuse::note_global_value_change(
+                    self as *const Self as usize,
+                    slot,
+                    same,
+                );
+            } else {
+                crate::object_fuse::note_value_change(self as *const Self as usize, slot);
+            }
+        }
+    }
+
+    /// A reporting map changed the property at `slot` other than by a data value write (an
+    /// accessor pair replaced in place).
+    #[cold]
+    #[inline(never)]
+    fn note_fused_change(&self, slot: usize) {
         if self
             .entries
             .keys()
@@ -9940,6 +10138,45 @@ impl Props {
         {
             crate::object_fuse::note_value_change(self as *const Self as usize, slot);
         }
+    }
+
+    /// A watched global's every property may have changed: its map replaced whole or taken, or
+    /// the object no longer ordinary (F4 part 2, W8 and W9).
+    #[cold]
+    #[inline(never)]
+    fn note_fused_all_changed(&self) {
+        crate::object_fuse::note_all_changed(self as *const Self as usize);
+    }
+
+    /// Whether this map's writes report to a fuse: a marked prototype's ([`FLAG_PROTO`]) or a
+    /// watched global's ([`CLASS_WATCHED`]), one test of [`FLAG_REPORTS`] (a derived class
+    /// constructor's map passes it too, and its cold report finds no fuse).
+    #[inline]
+    fn reports_writes(&self) -> bool {
+        self.flag(FLAG_REPORTS)
+    }
+
+    /// Mark this map a realm's global object's, watched by the fuse registered for it next
+    /// (F4 part 2, R-1 U1): a fresh shape of its own, the first of the fresh serials it takes for
+    /// its life.
+    pub(crate) fn mark_watched_global(&mut self) {
+        debug_assert_eq!(
+            self.entries.flags.get() & FLAG_CLASS_MASK,
+            0,
+            "a global object is no class constructor"
+        );
+        self.entries
+            .flags
+            .set(self.entries.flags.get() | FLAG_CLASS_MASK);
+        let shape = shape_fresh(self.entries.class());
+        self.entries.set_shape(shape);
+    }
+
+    /// Whether this is a watched global's map ([`CLASS_WATCHED`]), whose writing caches are
+    /// filled only for a NotConstant property (F4 part 2, R2: `Interp::may_store_in_line`).
+    #[inline]
+    pub(crate) fn watched(&self) -> bool {
+        self.entries.watched()
     }
 
     /// A marked prototype removes its named property at `slot`.
@@ -10048,7 +10285,8 @@ impl Props {
     /// changing identities owned by other tests/Agents. This only withdraws this map's proof.
     #[cfg(test)]
     pub(crate) fn force_uncacheable_shape_for_test(&mut self) {
-        self.entries.shape = uncacheable_shape(self.entries.class());
+        let shape = uncacheable_shape(self.entries.class());
+        self.entries.set_shape(shape);
     }
 
     /// Borrow the immutable key layout, live prefix and attributes for enumeration. Numeric
@@ -10712,7 +10950,8 @@ impl Props {
     /// Mint a fresh unique shape: no inline cache recorded against the old id can hit
     /// again, so any proof it carried (slot, and eventually class) is abandoned.
     pub(crate) fn demote_shape(&mut self) {
-        self.entries.shape = shape_fresh(self.entries.class());
+        let shape = shape_fresh(self.entries.class());
+        self.entries.set_shape(shape);
     }
     /// Value-only write to an existing property (the caller has established it is a
     /// writable data property): the descriptor — and therefore the shape class — is
@@ -10732,8 +10971,8 @@ impl Props {
         }
         match self.find_text(text) {
             Some(i) => {
-                if self.proto_flag() {
-                    self.note_fused_value_write(i);
+                if self.reports_writes() {
+                    self.note_fused_value_write(i, v);
                 }
                 self.entries.slot(i).set_value(v);
                 true
@@ -10746,8 +10985,34 @@ impl Props {
     /// writable data descriptor there.
     pub(crate) fn set_value_at(&mut self, slot: usize, v: Value) -> bool {
         if slot < self.entries.len() {
+            if self.reports_writes() {
+                self.note_fused_value_write(slot, v);
+            }
+            self.entries.slot(slot).set_value(v);
+            true
+        } else {
+            false
+        }
+    }
+    /// [`Props::set_value_at`] for a cache's hit, with no report to a watched global's fuse:
+    /// the fill of every cache that writes proved the slot's property NotConstant there (F4 part
+    /// 2, R2: `Interp::may_store_in_line`), which no write moves while the map's shape holds.
+    /// A fused prototype's map reports as before; debug builds check the rule again.
+    pub(crate) fn set_value_at_proven(&mut self, slot: usize, v: Value) -> bool {
+        if slot < self.entries.len() {
+            #[cfg(debug_assertions)]
+            if self.entries.watched() {
+                assert!(
+                    crate::object_fuse::global_may_store_in_line(
+                        None,
+                        self as *const Self as usize,
+                        slot
+                    ),
+                    "a proven store reached a watched global's property that is not NotConstant"
+                );
+            }
             if self.proto_flag() {
-                self.note_fused_value_write(slot);
+                self.note_fused_value_write(slot, v);
             }
             self.entries.slot(slot).set_value(v);
             true
@@ -10793,7 +11058,11 @@ impl Props {
         if set.is_some() {
             p.set_setter(set);
         }
-        // A new pair cell in the same slot: the attributes, and so the shape, are unchanged.
+        // A new pair cell in the same slot: the attributes, and so the shape, are unchanged. The
+        // accessors' change is a value change (SpiderMonkey's Watchtower.cpp:745-747).
+        if self.reports_writes() {
+            self.note_fused_change(i);
+        }
         let changed = self.entries.replace(i, p);
         debug_assert!(!changed, "a merge keeps the accessor's attributes");
         true
@@ -10835,8 +11104,11 @@ impl Props {
         // Each key whose attributes change takes its attribute-change transition, in key order,
         // as `Object.freeze`'s defines do (an array's element entries are exempt, as in
         // `insert`).
+        // A watched global's map takes one fresh shape instead (`NamedEntries::set_shape`).
         let elem_mode = self.elem_mode();
+        let watched = self.entries.watched();
         let mut shape = self.entries.shape;
+        let mut changed = false;
         let len = self.entries.len();
         for slot in 0..len {
             let key = self.entries.keys()[slot];
@@ -10845,10 +11117,18 @@ impl Props {
             p.set_configurable(false);
             let attrs = p.attrs();
             if self.entries.replace(slot, p) && !(elem_mode && key.as_index().is_some()) {
-                shape = shape_change(shape, key, attrs);
+                changed = true;
+                if !watched {
+                    shape = shape_change(shape, key, attrs);
+                }
             }
         }
-        self.entries.shape = shape;
+        if changed {
+            if watched {
+                shape = shape_fresh(self.entries.class());
+            }
+            self.entries.set_shape(shape);
+        }
     }
     pub(crate) fn contains(&self, key: &str) -> bool {
         self.get(key).is_some()
@@ -10905,7 +11185,7 @@ impl Props {
     #[cfg(test)]
     pub(crate) fn clear(&mut self) {
         self.note_structural();
-        if self.proto_flag() {
+        if self.reports_writes() {
             self.note_fused_clear();
         }
         self.entries.clear();
@@ -10914,7 +11194,8 @@ impl Props {
         self.entries.len_slot.set(SlotMemo::NONE);
         self.entries.proto_slot.set(SlotMemo::NONE);
         self.set_has_far(false);
-        self.entries.shape = shape_fresh(self.entries.class());
+        let shape = shape_fresh(self.entries.class());
+        self.entries.set_shape(shape);
     }
     /// Append the next element word while *building a fresh array in order* (its elements so
     /// far are exactly the words 0..len, with no index key in the named entries): skips the
@@ -10950,7 +11231,14 @@ impl Props {
                 self.entries.layout = Some(layout);
             }
         }
-        self.entries.shape = new_shape;
+        // A creation way's hit (or a fresh object's build): never a watched global's map. A way
+        // made on a watched global records a receiver shape no map takes again, since its every
+        // shape is a fresh serial of its own (`NamedEntries::set_shape`), so it never hits.
+        debug_assert!(
+            !self.entries.watched(),
+            "a creation way's hit on a watched global"
+        );
+        self.entries.set_shape(new_shape);
         self.entries.push((key, prop));
         self.note_inserted(slot);
         self.ensure_fallback_index();
@@ -10987,9 +11275,10 @@ impl Props {
     }
 
     pub(crate) fn finish_proven_plain_shape(&mut self, shape: u32) {
+        debug_assert!(!self.entries.watched(), "a builder's map is no global's");
         debug_assert!(!self.entries.is_empty());
         debug_assert!(self.entries.len() <= INDEX_THRESHOLD);
-        self.entries.shape = shape;
+        self.entries.set_shape(shape);
     }
 
     pub(crate) fn insert(&mut self, key: impl IntoPropKey, prop: Property) {
@@ -11064,7 +11353,7 @@ impl Props {
             self.set_has_far(true);
         }
         if let Some(i) = self.find(key) {
-            if self.proto_flag() && key.as_index().is_none() {
+            if self.reports_writes() && key.as_index().is_none() {
                 self.note_fused_redefine(i, &prop);
             }
             if self
@@ -11079,7 +11368,12 @@ impl Props {
             // tracks named keys only. A replacement that keeps the attributes keeps the shape.
             let attrs = prop.attrs();
             if self.entries.replace(i, prop) && !(self.elem_mode() && key.as_index().is_some()) {
-                self.entries.shape = shape_change(self.entries.shape, key, attrs);
+                let shape = if self.entries.watched() {
+                    shape_fresh(self.entries.class())
+                } else {
+                    shape_change(self.entries.shape, key, attrs)
+                };
+                self.entries.set_shape(shape);
             }
         } else {
             self.note_structural();
@@ -11102,9 +11396,13 @@ impl Props {
                         .map(|(name, property)| (name, property.attrs()))
                         .collect::<Vec<_>>()
                 });
-                let (shape, layout) =
-                    shape_transition(self.entries.shape, key, prop.attrs(), prefix.as_deref());
-                self.entries.shape = shape;
+                // A watched global's map reads and writes no transition (R-1, U2).
+                let (shape, layout) = if self.entries.watched() {
+                    (shape_fresh(self.entries.class()), None)
+                } else {
+                    shape_transition(self.entries.shape, key, prop.attrs(), prefix.as_deref())
+                };
+                self.entries.set_shape(shape);
                 if let Some(layout) = layout {
                     self.entries.layout = Some(layout);
                 }
@@ -11175,7 +11473,8 @@ impl Props {
             self.note_inserted(slot);
         }
         // A removal shifts slots: it can't be a tree transition, so deopt to a fresh unique id.
-        self.entries.shape = shape_fresh(self.entries.class());
+        let shape = shape_fresh(self.entries.class());
+        self.entries.set_shape(shape);
     }
 
     pub(crate) fn remove(&mut self, key: &str) -> bool {
@@ -11208,7 +11507,7 @@ impl Props {
         let removed_far = key.as_index().is_some();
         self.note_structural();
         // An index key is no fused property, but the later slots move down all the same.
-        if self.proto_flag() {
+        if self.reports_writes() {
             self.note_fused_remove(i);
         }
         self.entries.remove(i);
@@ -11217,7 +11516,8 @@ impl Props {
         // this for ELEMENT keys: their shape tracks named keys only, and array entry slots are
         // only ever trusted through key-checked ICs (IC_ARR_KEYCHK), which re-verify on hit.
         if !(self.elem_mode() && key.as_index().is_some()) {
-            self.entries.shape = shape_fresh(self.entries.class());
+            let shape = shape_fresh(self.entries.class());
+            self.entries.set_shape(shape);
         }
         self.entries.len_slot.set(SlotMemo::NONE);
         self.entries.proto_slot.set(SlotMemo::NONE);

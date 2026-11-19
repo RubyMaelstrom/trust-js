@@ -7593,10 +7593,17 @@ pub(crate) fn writes_property(op: &Op) -> bool {
     )
 }
 
+/// Whether a name site (`store`: one that writes) takes a seed a site filled (`seed_store`: a
+/// writing one): a writing site takes only a writing site's seed, whose global entries were filled
+/// under the rule that lets its hits store with no report (F4 part 2, R2; `Chunk::name_ic_fill`).
+pub(crate) fn name_seed_fits(store: bool, seed_store: bool) -> bool {
+    seed_store || !store
+}
+
 /// Empty the store and update sites a read site's ways seeded (W4 step 9): a recompilation's
 /// seeds follow the sites' order and names, and a read's ways may hold a property that is not
 /// writable, which a store site's generated code no longer tests.
-fn clear_read_seeded_stores(
+pub(crate) fn clear_read_seeded_stores(
     ops: &[Op],
     read_seeded: &[u32],
     caches: &mut [std::cell::Cell<IcState>],
@@ -13093,7 +13100,8 @@ impl Compiler {
             let site = sites.get(*cursor);
             *cursor += 1;
             site.filter(|(hot_name, .., seed_store)| {
-                hot_name.as_ref() == self.names[name as usize].as_ref() && (*seed_store || !store)
+                hot_name.as_ref() == self.names[name as usize].as_ref()
+                    && name_seed_fits(store, *seed_store)
             })
             .cloned()
         });
@@ -25023,6 +25031,19 @@ impl Chunk {
         if p.accessor() || (store && !p.writable()) {
             return None;
         }
+        // A writing site's hits store with no report: only to a NotConstant property of a
+        // watched global (F4 part 2, R2; SpiderMonkey's canOptimizeSetSlot). A writing site's
+        // cache holding this shape and slot already asked: its entries come from writing fills
+        // and writing sites' seeds (`Compiler::new_name_cache`), and the property stays
+        // NotConstant while the global keeps the shape.
+        if store {
+            let held = self.name_caches[c as usize].get();
+            let proven = held.env == Env::as_ptr(env) as usize | 1
+                && held.binding == ((g.props.shape() as u64) << 32) | slot as u64;
+            if !proven && !i.may_store_in_line(&g.props, slot) {
+                return None;
+            }
+        }
         let v = p.value();
         // Generated code finds the slot by its location word (W2d step 3), which global mode
         // keeps in `act_gen`; a slot past the cache's reach stays uncached.
@@ -25253,7 +25274,9 @@ impl Chunk {
                 if g.kind.exotic_is_none() && g.props.shape() == (ic.binding >> 32) as u32 {
                     if let Some((_, p)) = g.props.entry_at(ic.binding as u32 as usize) {
                         if !p.accessor() && p.writable() {
-                            g.props.set_value_at(ic.binding as u32 as usize, value);
+                            // The writing site's fill proved the property NotConstant.
+                            g.props
+                                .set_value_at_proven(ic.binding as u32 as usize, value);
                             return Ok(());
                         }
                     }

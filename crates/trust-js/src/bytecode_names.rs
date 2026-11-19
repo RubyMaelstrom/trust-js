@@ -224,6 +224,12 @@ impl ResolutionIc {
                 }
                 // HasBinding is true for any own property, not merely readable data values.
                 let slot = global.props.slot_of(name)?;
+                // A Reference is made for an assignment, which StoreRef's template makes through
+                // the hint the in-line capture copies from this descriptor: a watched global's
+                // property only once NotConstant (F4 part 2, R2).
+                if !i.may_store_in_line(&global.props, slot) {
+                    return None;
+                }
                 Some(Target::Global {
                     shape: global.props.shape(),
                     slot,
@@ -413,7 +419,8 @@ impl DeepNameIc {
                 if let Some((_, property)) = global.props.entry_at(slot) {
                     if !property.accessor() && property.writable() {
                         let value = value.take().unwrap();
-                        global.props.set_value_at(slot, value);
+                        // The writing site's fill proved the property NotConstant.
+                        global.props.set_value_at_proven(slot, value);
                         return true;
                     }
                 }
@@ -494,7 +501,8 @@ impl Chunk {
                 }
                 let slot = global.props.slot_of(&self.names[n as usize])?;
                 let property = global.props.slot_at(slot)?;
-                if property.accessor() {
+                // A writing site's hits store with no report (F4 part 2, R2).
+                if property.accessor() || (store && !i.may_store_in_line(&global.props, slot)) {
                     return None;
                 }
                 Some((

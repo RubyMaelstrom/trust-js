@@ -60,14 +60,19 @@ fn check(source: &str, expected: &str) {
 fn prepared_reference_own_cold_global_updates_take_actual_hint_paths_in_every_tier() {
     // Below the unchanged128-backedge admission threshold: every tier exercises the AST
     // path behind the public API regression, not an already-optimized VM/native substitute.
+    // Both globals are written twice first: a Reference keeps a hint for a global property
+    // only once it is NotConstant (F4 part 2, R2), so the loop's References all take theirs.
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
         let mut engine = Engine::new();
         engine.set_tier(tier);
+        engine
+            .eval("var total=0,index=0;total=0;index=0;", false)
+            .unwrap();
         reset_paths();
         assert_eq!(
             run(
                 &mut engine,
-                "var total=0;for(var index=0;index<100;index++)total+=index;total;"
+                "total=0;for(index=0;index<100;index++)total+=index;total;"
             ),
             "4950"
         );

@@ -153,6 +153,8 @@ mod gc_storage;
 mod gc_sweep;
 mod gc_trace;
 #[cfg(test)]
+mod global_fuse_tests;
+#[cfg(test)]
 mod group_by_tests;
 #[cfg(all(test, feature = "embed"))]
 mod handle_tests;
@@ -373,6 +375,7 @@ pub fn unstable_regexp_prof_report() -> Option<String> {
 pub fn unstable_feedback_census_dump() {
     #[cfg(feature = "architecture-diagnostics")]
     crate::feedback_census::dump();
+    crate::object_fuse::global_census_dump();
 }
 
 pub fn unstable_performance_metrics_json(engine: &Engine) -> Option<String> {

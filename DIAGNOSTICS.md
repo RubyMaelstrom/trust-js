@@ -203,7 +203,12 @@ comment/example in the same change.
   once (`TestSwitches::asynchronous` false) do too.
   `TRUST_JS_OPT_NO_REOPT=1` keeps stage 1's fallback for good: a discard flags nothing, adds
   nothing to R and arms no recompile. `TRUST_JS_OPT_NO_EXIT_PROFILE=1` flags nothing, so that
-  recompiles decline nothing (the feedback alone guides them). `TRUST_JS_OPT_LOG=1` prints one
+  recompiles decline nothing (the feedback alone guides them). `TRUST_JS_OPT_LOG=1` prints, at
+  the shell's end of run, the census of the realms' global objects' reported writes (`[opt] global
+  stores: checked <n>, constants changed <n>, same value <n>, fills refused <n>, reference hints
+  refused <n>`: value writes that reached Rust, those that made a Constant property NotConstant
+  and of them the same-value stores, and the writing caches' fills and Reference hints refused
+  for a property not yet NotConstant), and one
   stderr line per compile (with its time and code range, `at <base> <length>` in hex), refusal
   (with its reason and pc; `over the size limit` for a chunk past 15,000 operations, with `(<n>
   ops, before its recompile)` where it had nothing to splice), install of the tier's code in a

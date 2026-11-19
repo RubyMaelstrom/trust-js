@@ -4808,11 +4808,13 @@ pub struct Interp {
     /// properties so cross-realm fast paths can prove the constructor's actual realm identity.
     pub(crate) array_ctor: Option<Gc>,
     pub(crate) string_proto: Gc,
-    /// The active Realm's String.prototype fuse (`crate::object_fuse`), swapped with
-    /// `string_proto`; `string_proto_fuse_ptr` is its address, which generated code reads
-    /// through ctx.interp (`InterpLayout::string_proto_fuse`). `None` (and 0) while the Realm's
-    /// built-ins are being installed.
-    pub(crate) string_proto_fuse: Option<std::sync::Arc<crate::object_fuse::ObjectFuse>>,
+    /// The active Realm's fuses (`crate::object_fuse::RealmFuses`): its String.prototype's,
+    /// swapped with `string_proto`, whose address `string_proto_fuse_ptr` is, which generated
+    /// code reads through ctx.interp (`InterpLayout::string_proto_fuse`), and its global
+    /// object's (F4 part 2). `None` (and 0) while the Realm's built-ins are being installed. One
+    /// pointer, the size the String.prototype fuse alone had, so that the layout generated code
+    /// reads stays.
+    pub(crate) realm_fuses: Option<std::sync::Arc<crate::object_fuse::RealmFuses>>,
     pub(crate) string_proto_fuse_ptr: usize,
     pub(crate) number_proto: Gc,
     pub(crate) boolean_proto: Gc,
@@ -5330,7 +5332,7 @@ interp_memory_inventory! {
     array_proto => "measured",
     array_ctor => "measured",
     string_proto => "measured",
-    string_proto_fuse => "external",
+    realm_fuses => "external",
     string_proto_fuse_ptr => "non_owning",
     number_proto => "measured",
     boolean_proto => "measured",
@@ -6272,7 +6274,10 @@ pub struct RealmState {
     pub array_proto: Gc,
     pub array_ctor: Option<Gc>,
     pub string_proto: Gc,
-    pub(crate) string_proto_fuse: Option<std::sync::Arc<crate::object_fuse::ObjectFuse>>,
+    /// The realm's fuses (`Interp::realm_fuses`): String.prototype's and the global object's.
+    /// One pointer: `Interp::ctor_caller_realm` holds a RealmState by value, so its size is part
+    /// of the layout generated code reads.
+    pub(crate) realm_fuses: Option<std::sync::Arc<crate::object_fuse::RealmFuses>>,
     pub(crate) regexp_statics: RealmRegexpStatics,
     pub number_proto: Gc,
     pub boolean_proto: Gc,
@@ -6331,7 +6336,7 @@ impl Interp {
             array_proto: self.array_proto,
             array_ctor: self.array_ctor,
             string_proto: self.string_proto,
-            string_proto_fuse: self.string_proto_fuse.clone(),
+            realm_fuses: self.realm_fuses.clone(),
             regexp_statics: self.regexp_statics.clone(),
             number_proto: self.number_proto,
             boolean_proto: self.boolean_proto,
@@ -6340,6 +6345,60 @@ impl Interp {
             eval_fn: self.eval_fn,
             extra_protos: self.extra_protos.clone(),
         }
+    }
+
+    /// The active realm's global object's fuse (F4 part 2; tests until the fold reads it).
+    #[cfg(test)]
+    pub(crate) fn global_fuse(&self) -> Option<std::sync::Arc<crate::object_fuse::ObjectFuse>> {
+        self.realm_fuses.as_ref()?.global.clone()
+    }
+
+    /// The active realm's global object's fuse, reached from the realm with no registry.
+    #[inline]
+    pub(crate) fn active_global_fuse(&self) -> Option<&crate::object_fuse::ObjectFuse> {
+        self.realm_fuses.as_deref()?.global.as_deref()
+    }
+
+    /// Whether a cache may let generated code or the VM write the named slot `slot` of the map
+    /// `props` without a report (F4 part 2, R2; SpiderMonkey's canOptimizeSetSlot,
+    /// vm/ObjectFuse.h:222-224): any map's but a watched global's, whose property must be
+    /// NotConstant. Every fill of a cache that writes asks. For the active realm's global the
+    /// answer is a few loads (`ObjectFuse::state`); another realm's global asks the registry.
+    #[inline]
+    pub(crate) fn may_store_in_line(&self, props: &crate::value::Props, slot: usize) -> bool {
+        !props.watched() || self.watched_may_store_in_line(props, slot)
+    }
+
+    /// [`Interp::may_store_in_line`] of a watched map, out of its callers' line: the fills that
+    /// ask stay as small as before.
+    #[inline(never)]
+    fn watched_may_store_in_line(&self, props: &crate::value::Props, slot: usize) -> bool {
+        crate::object_fuse::global_may_store_in_line(
+            self.active_global_fuse(),
+            props as *const crate::value::Props as usize,
+            slot,
+        )
+    }
+
+    /// The active realm's String.prototype fuse.
+    pub(crate) fn string_proto_fuse(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::object_fuse::ObjectFuse>> {
+        self.realm_fuses.as_ref()?.string_proto.as_ref()
+    }
+
+    /// The state of the active realm's global object's own property `name` (tests).
+    #[cfg(test)]
+    pub(crate) fn global_property_state(
+        &self,
+        name: &str,
+    ) -> Option<crate::object_fuse::PropertyState> {
+        let global = self.global.borrow();
+        let slot = global.props.slot_of(name)?;
+        Some(crate::object_fuse::global_property_state(
+            &global.props as *const _ as usize,
+            slot,
+        ))
     }
 
     /// Install a realm's intrinsics as the active ones.
@@ -6353,7 +6412,7 @@ impl Interp {
         self.array_proto = r.array_proto;
         self.array_ctor = r.array_ctor;
         self.string_proto = r.string_proto;
-        self.set_string_proto_fuse(r.string_proto_fuse.clone());
+        self.set_realm_fuses(r.realm_fuses.clone());
         self.regexp_statics = r.regexp_statics.clone();
         self.number_proto = r.number_proto;
         self.boolean_proto = r.boolean_proto;
@@ -6383,9 +6442,9 @@ impl Interp {
         std::mem::swap(&mut self.array_proto, &mut saved.array_proto);
         std::mem::swap(&mut self.array_ctor, &mut saved.array_ctor);
         std::mem::swap(&mut self.string_proto, &mut saved.string_proto);
-        let fuse = saved.string_proto_fuse.take();
-        saved.string_proto_fuse = self.string_proto_fuse.take();
-        self.set_string_proto_fuse(fuse);
+        let fuses = saved.realm_fuses.take();
+        saved.realm_fuses = self.realm_fuses.take();
+        self.set_realm_fuses(fuses);
         std::mem::swap(&mut self.regexp_statics, &mut saved.regexp_statics);
         std::mem::swap(&mut self.number_proto, &mut saved.number_proto);
         std::mem::swap(&mut self.boolean_proto, &mut saved.boolean_proto);
@@ -6592,10 +6651,11 @@ impl Interp {
         self.error_protos = Default::default();
         self.extra_protos = Default::default();
         self.eval_fn = None;
-        self.set_string_proto_fuse(None);
+        self.set_realm_fuses(None);
         self.regexp_statics = Default::default();
         crate::builtins::install(self);
         self.install_string_proto_fuse();
+        self.install_global_fuse();
         // Top-level `this` is the new global.
         let g = Value::Obj(self.global);
         self.global_env
@@ -6697,23 +6757,63 @@ impl Interp {
             body.props.mark_proto();
             crate::object_fuse::ObjectFuse::new_registered(&body.props as *const _ as usize)
         };
-        self.set_string_proto_fuse(Some(fuse));
+        let global = self
+            .realm_fuses
+            .as_ref()
+            .and_then(|fuses| fuses.global.clone());
+        self.set_realm_fuses(Some(std::sync::Arc::new(crate::object_fuse::RealmFuses {
+            string_proto: Some(fuse),
+            global,
+        })));
     }
 
-    /// Install `fuse` as the active Realm's String.prototype fuse, and its address for generated
-    /// code.
-    pub(crate) fn set_string_proto_fuse(
-        &mut self,
-        fuse: Option<std::sync::Arc<crate::object_fuse::ObjectFuse>>,
-    ) {
-        self.string_proto_fuse_ptr = fuse
+    /// Make the active Realm's global object's fuse (F4 part 2, `crate::object_fuse`), once its
+    /// built-ins are installed: its map is marked watched, with a fresh shape of its own
+    /// (`Props::mark_watched_global`, R-1 U1), and the fuse is registered by that map's address.
+    /// The realm's fuses (`Interp::realm_fuses`, and its record in `Interp::realms`) own it.
+    pub(crate) fn install_global_fuse(&mut self) {
+        let global = self.global;
+        let fuse = {
+            let mut body = global.borrow_mut();
+            body.props.mark_watched_global();
+            crate::object_fuse::ObjectFuse::new_registered(&body.props as *const _ as usize)
+        };
+        let string_proto = self
+            .realm_fuses
             .as_ref()
+            .and_then(|fuses| fuses.string_proto.clone());
+        self.set_realm_fuses(Some(std::sync::Arc::new(crate::object_fuse::RealmFuses {
+            string_proto,
+            global: Some(fuse),
+        })));
+    }
+
+    /// Install `fuses` as the active Realm's, and its String.prototype fuse's address for
+    /// generated code.
+    pub(crate) fn set_realm_fuses(
+        &mut self,
+        fuses: Option<std::sync::Arc<crate::object_fuse::RealmFuses>>,
+    ) {
+        self.string_proto_fuse_ptr = fuses
+            .as_ref()
+            .and_then(|fuses| fuses.string_proto.as_ref())
             .map_or(0, |fuse| std::sync::Arc::as_ptr(fuse) as usize);
-        self.string_proto_fuse = fuse;
+        crate::object_fuse::set_active_global(
+            fuses.as_ref().and_then(|fuses| fuses.global.as_ref()),
+        );
+        self.realm_fuses = fuses;
     }
 }
 
 impl RealmState {
+    /// The realm's String.prototype fuse (tests).
+    #[cfg(test)]
+    pub(crate) fn string_proto_fuse(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::object_fuse::ObjectFuse>> {
+        self.realm_fuses.as_ref()?.string_proto.as_ref()
+    }
+
     pub(crate) fn snapshot_clone(&self) -> RealmState {
         RealmState {
             global: self.global,
@@ -6725,7 +6825,7 @@ impl RealmState {
             array_proto: self.array_proto,
             array_ctor: self.array_ctor,
             string_proto: self.string_proto,
-            string_proto_fuse: self.string_proto_fuse.clone(),
+            realm_fuses: self.realm_fuses.clone(),
             regexp_statics: self.regexp_statics.clone(),
             number_proto: self.number_proto,
             boolean_proto: self.boolean_proto,
@@ -7095,7 +7195,7 @@ impl Interp {
             array_proto,
             array_ctor: None,
             string_proto,
-            string_proto_fuse: None,
+            realm_fuses: None,
             string_proto_fuse_ptr: 0,
             number_proto,
             boolean_proto,
@@ -7249,6 +7349,7 @@ impl Interp {
         };
         crate::builtins::install(&mut interp);
         interp.install_string_proto_fuse();
+        interp.install_global_fuse();
         // `this` at the top level is the global object (sloppy mode).
         let g = Value::Obj(interp.global);
         interp
@@ -11176,11 +11277,13 @@ impl Interp {
                     let Some(loc) = b.props.slot_location(slot) else {
                         return Some(v);
                     };
-                    // An update site's ways are store ways (W4 step 9): own writable data only.
+                    // An update site's ways are store ways (W4 step 9): own writable data only,
+                    // and of a watched global a NotConstant property (F4 part 2, R2).
                     if store_fill
                         && (depth != 0
                             || p.accessor()
-                            || !b.props.property_at(slot).is_some_and(|p| p.writable()))
+                            || !b.props.property_at(slot).is_some_and(|p| p.writable())
+                            || !self.may_store_in_line(&b.props, slot))
                     {
                         return Some(v);
                     }
@@ -11562,7 +11665,13 @@ impl Interp {
             if st.depth == 0 && b.props.shape() == st.recv_shape {
                 if let Some(p) = b.props.property_at(st.slot as usize) {
                     if !p.accessor() && p.writable() {
-                        b.props.set_value_at(st.slot as usize, *v);
+                        // Every way of a store or update site was filled under the rule (F4 part
+                        // 2, R2): its own fill and the stub cache's promotion below, the update's
+                        // read (`ic_get_rederive` under `ic_store_fill`), a writing site's seed;
+                        // a read site's seed never stays (`clear_read_seeded_stores`). So a
+                        // watched global's slot here is NotConstant, as generated code's in-line
+                        // store of the same way assumes.
+                        b.props.set_value_at_proven(st.slot as usize, *v);
                         return IcSet::Stored;
                     }
                 }
@@ -11579,7 +11688,11 @@ impl Interp {
                     if let Some(p) = b.props.property_at(e.st.slot as usize) {
                         if !p.accessor() && p.writable() {
                             b.props.set_value_at(e.st.slot as usize, *v);
-                            self.ic_insert(cache, e.st);
+                            // A store way only for a property a cache may store to with no
+                            // report (F4 part 2, R2): the stub cache's entries are reads' too.
+                            if self.may_store_in_line(&b.props, e.st.slot as usize) {
+                                self.ic_insert(cache, e.st);
+                            }
                             return IcSet::Stored;
                         }
                     }
@@ -11664,6 +11777,11 @@ impl Interp {
                 }
                 let shape = b.props.shape();
                 b.props.set_value_at(slot, *v);
+                // A store way only for a property a cache may store to with no report (F4 part
+                // 2, R2): a watched global's once the write just made left it NotConstant.
+                if !self.may_store_in_line(&b.props, slot) {
+                    return IcSet::Stored;
+                }
                 let Some(loc) = b.props.slot_location(slot) else {
                     return IcSet::Stored;
                 };
@@ -11822,7 +11940,9 @@ impl Interp {
         cache: &std::cell::Cell<crate::bytecode::IcState>,
     ) -> bool {
         use crate::bytecode::{IcState, IC_CREATE};
-        // Index-like names belong to the dense-element machinery — generic path.
+        // Index-like names belong to the dense-element machinery — generic path. (A way made on
+        // a watched global never hits: its receiver shape is a serial no map takes again, F4
+        // part 2, R-1 U2; `Props::append_new`.)
         if key.starts_with_digit() {
             return false;
         }
@@ -14216,7 +14336,7 @@ impl Interp {
             array_proto: _,
             array_ctor: _,
             string_proto: _,
-            string_proto_fuse: _,
+            realm_fuses: _,
             string_proto_fuse_ptr: _,
             number_proto: _,
             boolean_proto: _,
@@ -19982,6 +20102,15 @@ impl Interp {
             let global = self.global.borrow();
             if lex_names.iter().any(|n| global.props.contains(n.as_str())) {
                 global.props.move_slot_epoch();
+                // Each shadowed property's guards fail (F4 part 2, W10; SpiderMonkey's
+                // handleShadowedGlobalProperty, vm/ObjectFuse.cpp:182-191, from
+                // vm/EnvironmentObject.cpp's global lexical declaration).
+                let props = &global.props as *const _ as usize;
+                for name in lex_names.iter() {
+                    if let Some(slot) = global.props.slot_of(name.as_str()) {
+                        crate::object_fuse::note_shadowed(props, slot);
+                    }
+                }
             }
         }
         // Top-level `let`/`const` are pre-declared in their temporal dead zone.

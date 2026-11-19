@@ -214,13 +214,25 @@ impl Interp {
             let body = object.borrow();
             let shape = body.props.shape();
             if body.kind.is_ordinary() && crate::value::is_cacheable_shape(shape) {
+                // A Reference is made for an assignment, which StoreRef's template makes
+                // through this hint: a watched global's property only once NotConstant (F4
+                // part 2, R2). A hint that holds the shape was taken under that rule (here, by
+                // the resolution site's build, or by the in-line capture copying the build's
+                // descriptor), and the property stays NotConstant while the shape holds: it
+                // asks nothing again.
                 let slot = if shape == reference.shape {
                     Some(reference.slot)
+                        .filter(|slot| body.props.slot_at(*slot).is_some_and(|p| !p.accessor()))
                 } else {
-                    body.props.slot_of(&reference.name)
+                    body.props.slot_of(&reference.name).filter(|slot| {
+                        body.props.slot_at(*slot).is_some_and(|p| !p.accessor())
+                            && (self.may_store_in_line(&body.props, *slot) || {
+                                crate::object_fuse::note_refused_hint();
+                                false
+                            })
+                    })
                 };
-                slot.filter(|slot| body.props.slot_at(*slot).is_some_and(|p| !p.accessor()))
-                    .and_then(|slot| Some((shape, slot, body.props.slot_location(slot)?)))
+                slot.and_then(|slot| Some((shape, slot, body.props.slot_location(slot)?)))
             } else {
                 None
             }
@@ -454,7 +466,8 @@ impl Interp {
                     let mut body = reference.object.as_ref().unwrap().borrow_mut();
                     let (_, property) = body.props.entry_at(reference.slot).unwrap();
                     if property.writable() {
-                        body.props.set_value_at(reference.slot, value);
+                        // The hint was refreshed under the fill rule just above.
+                        body.props.set_value_at_proven(reference.slot, value);
                         #[cfg(test)]
                         record_reference_own_path(3);
                         return Ok(());
