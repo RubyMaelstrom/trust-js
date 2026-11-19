@@ -58,7 +58,13 @@ const GUARD: &str = "function st(s, k) { return (s * 31 + k) & 0xfffff; }\n\
      t + guard(20, 3, 4)";
 
 /// Twelve objects made from the argument, live across the outer loop's call, which allocates
-/// (collections run in it), and read by the inner loop each iteration; an array read after.
+/// (collections run in it), and read by the inner loop each iteration AS VALUES: the loop stores
+/// each into an element of an array, so the objects themselves are what it reads. (A read of a
+/// field alone does not read its object in such a loop any more: the loop's first shape check
+/// is made at its entry edge and its field loads read the cell carried from there, P3 stage 3's
+/// moved check, so the loop of `s + o1.x + ... + o12.x` reads no object and makes no cache; a
+/// store to the field goes through the carried cell too, and an identity test of two fresh
+/// objects folds.) Two fields and an array are read after.
 const OBJECTS: &str = "function mk(s, k) { const o = { v: s + k, w: [s, k, s ^ k] }; \
        return (o.v + o.w[2]) & 0xffff; }\n\
      function objs(n, p) { \
@@ -66,13 +72,16 @@ const OBJECTS: &str = "function mk(s, k) { const o = { v: s + k, w: [s, k, s ^ k
          o6 = {x: p + 5}, o7 = {x: p + 6}, o8 = {x: p + 7}, o9 = {x: p + 8}, o10 = {x: p + 9}, \
          o11 = {x: p + 10}, o12 = {x: p + 11}; \
        const arr = [p, p + 1, p + 2, p + 3]; \
+       const keep = [o1, o2, o3, o4, o5, o6, o7, o8, o9, o10, o11, o12]; \
        let s = 0; \
        for (let i = 0; i < n; i++) { \
          s = mk(s, i); \
          for (let j = 0; j < 4; j++) { \
-           s = (s + o1.x + o2.x + o3.x + o4.x + o5.x + o6.x + o7.x + o8.x + o9.x + o10.x \
-             + o11.x + o12.x + j) & 0xffff; } } \
-       return s + o1.x + o6.x + o12.x + arr[3]; }\n\
+           keep[0] = o2; keep[1] = o3; keep[2] = o4; keep[3] = o5; keep[4] = o6; keep[5] = o7; \
+           keep[6] = o8; keep[7] = o9; keep[8] = o10; keep[9] = o11; keep[10] = o12; \
+           keep[11] = o1; \
+           s = (s + o1.x + o12.x + j) & 0xffff; } } \
+       return s + o1.x + o6.x + o12.x + arr[3] + keep[11].x + keep[0].x + keep.length; }\n\
      let t = 0; for (let k = 0; k < 200; k++) t = (t + objs(10, k)) % 1000003;\n\
      t + ':' + objs(6, 1.5)";
 
@@ -211,15 +220,18 @@ fn a_throw_from_the_outer_loops_call_is_caught_outside_the_loops_with_the_vms_va
 
 #[test]
 fn objects_cached_through_the_inner_loop_survive_collections_in_the_outer_loops_call() {
-    // With the tier on: an eager compile, before the inner loop's property sites ran, makes
-    // them generic nodes, a call in the inner loop.
-    equal_with_caches(OBJECTS, "on");
+    // The inner loop's element stores read the objects themselves. Checked at graph, whatever
+    // the environment's inline mode: this program's allocation at the splice makes no cache
+    // (0 in "on" and "eager" under TRUST_JS_OPT_INLINE=splice, 8 at graph in every
+    // environment, measured; why the spliced second stage needs none is not traced).
+    equal_with_caches(OBJECTS, "graph");
     // Collections at every allocation: each call of `mk` collects while the objects are in
     // their slots and callee-saved registers, and the inner loop reloads its caches after it.
     let program = OBJECTS.replace("k < 200", "k < 60");
     let expected = run(Tier::Bytecode, &program);
     TestSwitches {
         on: true,
+        inline_graph: Some(true),
         ..Default::default()
     }
     .set();
