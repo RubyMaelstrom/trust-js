@@ -50,7 +50,9 @@ Read first, in this order:
 
 ## The repository's state
 
-- origin/main is a5411040 (stage 2's exit record). The working main is 28e60d11, 154 commits ahead
+- (For the state on 2026-11-19 read the last section, "2026-11-19, midday": origin/main is
+  6496547c there and local main is ahead of it again.) On the morning of 2026-11-18:
+  origin/main is a5411040 (stage 2's exit record). The working main is 28e60d11, 154 commits ahead
   and NOT PUSHED: all of stage 3 so far exists only in the coordinator's checkout
   (/big/Code/trust-js on the machine called Crystal). Pushes happen when the owner asks. Until
   that push, a fresh clone has none of what this note describes after stage 2.
@@ -226,6 +228,8 @@ Each is recorded where the plan line says; none blocks the lines above.
 - Tests are diagnostics (AGENTS.md, "Testing"): the nearest tests and the tier's modules per step;
   the whole library suite when a switch changes; full gates (Test262, difftest, the forced-exit and
   eager modes) at a stage's end.
+  A landing's check takes minutes (the owner, 2026-11-19; the last section has what that means in
+  practice).
 
 ## Local tools and evidence a fresh clone does not have
 
@@ -449,3 +453,59 @@ again. Scratch briefs kept under /tmp for stage 2's steps were lost; stage 3's a
   property after the first global's slot had moved (deleted and added again, or an earlier
   global removed). It dates from the phase-2 work on slot locations and is in every push
   since 2026-11-08. A push of main removes it from origin.
+
+## 2026-11-19, midday
+
+- THE OWNER'S WORD ON CHECKS (2026-11-19, the third time it had to be said): quick checks and
+  fixes if necessary; a change does not wait hours of tests before the next step. AGENTS.md
+  ("Testing") has the sentence. In practice, per landing: the implementer's fmt, clippy, the
+  tests nearest the change in the configurations it touches, and the mutations of its new
+  rules; the coordinator's diff read, one fat-LTO build, its adversarial programs at four
+  modes, the 5-run counts and the verifier sweep (under half an hour), and 200-run rows or
+  cycles only for what the change claims. The whole library suite, six-configuration module
+  runs, module-wide GC stress and the other machine's suite belong to a stage's end or to a
+  change that itself calls for one. Local main is fixed forward. The agents' standing rules
+  (target/p3/stage3/briefs/common.txt, last section) say the same.
+- LANDED ON LOCAL MAIN that morning, each with its record in the plan:
+  1. The template JIT's name-reference defect (936676c1, tests 0186a3d2).
+  2. The repeated tag test (143d39aa, 990b6cbd).
+  3. The global-read hoist, "F4 part 1", with the rule that a loop's writes are the union of
+     its own and every inlined frame's (62c19047..8edf64c4): Mandreel -14.1% instructions.
+  4. The register allocator's rule B (d6722c0e): zlib and Mandreel -3% instructions and -5%
+     cycles in both modes.
+  5. Shape and field facts through a loop that cannot change them, first commit (4797ca6d):
+     Box2D -0.6%, Crypto -0.5%, Richards -0.5%.
+  6. THE FLIP (b7514ddc): the tier inlines in its graph by default; `splice` is
+     TRUST_JS_OPT_INLINE=splice. The plan's record "The flip" has the table.
+- origin/main is still 6496547c (pushed 2026-11-18 09:12); local main is about 70 commits
+  ahead and NOT PUSHED. The line above under "The repository's state" that names a5411040 and
+  28e60d11 describes the morning of 2026-11-18, before that push. The owner has been asked
+  whether to push (origin has the defect of item 1) and has not answered.
+- IN FLIGHT, each with a brief under target/p3/stage3/briefs/ and STATUS.txt / NEXT.txt in
+  its evidence directory:
+  1. Dependencies on global properties ("F4 part 2"; f4-part2.txt, f4-part2-build.txt,
+     f4-part2-layer1b.txt; branch p3-s3-f4p2; evidence f4p2-impl, design-note.txt with its
+     "AFTER REVIEW" section). Four layers: (1) a one-way state per global property
+     (untracked, constant, not constant) kept by every store path, which lands and is
+     measured on its own; (2) dependent codes and a validity word; (3) the tier's folded
+     reads with a test after calls; (4) the teacher and the limit. Layer 1's first form cost
+     the default configuration too much (the fixtures +0.14%, a VM store to a global +250 to
+     800 instructions) and is being reworked: a state read without a lock, no second check
+     where a cache already proves the slot. After part 1 is measured: the dependency on a
+     typed array's buffer, V8's engine-wide form.
+  2. Shape facts, second commit (loopfacts-commit2.txt; branch p3-s3-loopfacts3; evidence
+     lf3-impl): the first shape check of an object the loop does not change, moved to the
+     loop's entry edge. Counted before code: Crypto -0.66% predicted at 200 runs.
+- NOT STARTED, in the order the counts give (the plan's records of rule B and of the carry):
+  the lazy context switch for property reads in inlined frames (DeltaBlue 1.15%, Vue's steady
+  state 0.67%, TypeScript 0.43% predicted); the lowered store that mixes replacing and
+  creating a property (Splay 0.82%, at the splice too); the intrinsic call as a node
+  (DeltaBlue 0.32%); stable shapes through calls on the dependency mechanism (75% of
+  Richards', 97% of DeltaBlue's, 66% of RayTrace's repeated shape checks); facts a join drops
+  (TypeScript 70%, Box2D 23% of theirs); the determinism rule for a reoptimization's choice
+  of inlined ways (target/p3/stage3/tsmode-impl/report.txt section 7, approved, about an
+  hour); owner questions 8 and 11 above.
+- A cost to know before planning a GC-stress run: a test build verifies the whole heap at
+  every collection, so a test that allocates in a loop of thousands of iterations takes an
+  hour or more under TRUST_JS_GC_STRESS=1 (one of piece B's never finished in six hours).
+  Name the tests a stress run covers and give it a time limit.

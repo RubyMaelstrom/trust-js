@@ -7221,3 +7221,54 @@ loop that writes none.
   the rest of the repeated shape checks are: in loops that call (Richards 75%, DeltaBlue 97%,
   RayTrace 66%), which need the dependencies the owner approved, and outside any loop
   (TypeScript 70%, Box2D 23%), where a join drops the fact.
+
+The flip (design step 4; b7514ddc; 2026-11-19; target/p3/stage3/flip-review). The tier
+inlines in its graph by default: TRUST_JS_OPT_INLINE's default is `graph`, `splice` is
+selectable, and any other value is `graph`. The splice stays in the engine: it is the second
+stage with the tier off, the way of the plans the graph does not take, and the way of a
+function whose in-place compile the tier refused. The change is the default's one line
+(opt/driver.rs, inline_graph) and the documents; the 34 tests whose subject is the splice pin
+it themselves (target/p3/stage3/step3g-impl/rehearsal-pins.txt), so no test changed.
+- The owner's decision of the same day: after rule B, on the table retaken on that engine,
+  GBEMU's and Splay's gaps recorded and not waited for.
+- The table, one binary (rule B's, target/p2/lto/8aa28538), graph against the splice,
+  instructions at 200 fixed runs unless said, then cycles on one X925 core (three rounds,
+  taken with another session's compiles on the machine, load 14 to 25: their spreads are 0.5%
+  to 14% and they are indicative only):
+    React's steady state -39.7%  -44.6%      Crypto            -0.22%  -0.5%
+    DeltaBlue            -16.0%  -25.3%      PdfJS             -0.11%  +0.8%
+    Richards              -9.5%  -12.7%      zlib (5 runs)      0.00%  +0.1%
+    Box2D                 -2.2%   -2.6%      RegExp             0.00%  +0.4%
+    TypeScript (5 runs)   -1.5%   -4.6%      Navier-Stokes      0.00%  -0.2%
+    Vue's steady state    -1.2%   -1.6%      CodeLoad          +0.02%  +1.7%
+    Djot's steady state   -1.0%   -2.4%      Splay             +0.12%  -2.9%
+    Earley-Boyer          -1.0%   -0.8%      GBEMU             +0.17%  -0.8%
+    RayTrace              -0.4%   -2.0%
+    Mandreel (5 runs)     -0.35%   0.0%
+  TypeScript's row is not read by the mutator's instructions here (its two collector modes).
+  The cycle rows of the workloads level in instructions (CodeLoad, PdfJS, RegExp) are inside
+  their spreads.
+- The flip's own build against main's (fat LTO, target/p2/lto/b7514ddc against 871a13c8, 5
+  fixed runs; flip-review/f5-*.out): the new default against the old one, Octane's geometric
+  mean -3.6% instructions (Richards -20.1%, DeltaBlue -11.9%, RayTrace -9.4%, Box2D -2.5%,
+  TypeScript -2.1%, GBEMU -1.9%, Crypto and Earley-Boyer -1.3%; Splay +0.6% at this length,
+  its marker's schedule, +0.12% above with the marker off), React's fixture -20.1%, Djot's
+  -1.8%, Vue's -1.1%. Both builds at explicit `graph` and both at explicit `splice` are equal
+  (the Octane mean -0.03% and +0.01%). The tier off is equal: the Octane mean +0.001%, every
+  benchmark within 0.007% but PdfJS (+0.07%, its clock) and TypeScript (-0.07%, inside its
+  spread); Djot's fixture reads +0.10% with the tier off and the same in every mode, between
+  two binaries one expression apart: a draw of the binary's layout, not charged.
+- What the tier off pays: nothing in generated code. With the tier off one runtime condition
+  at a first stage's inline checkpoint (interpreter.rs, the stale-chain request) now reads
+  `in_place(chunk)`, false there, where the mode's test ended it before.
+- Checked (the owner's word on quick checks; this one changes a default, so it has one suite
+  run): the tier's modules with TRUST_JS_OPT=1 at the new default, with
+  TRUST_JS_OPT_INLINE=splice and eager, 742 passed and none failed in each; the whole library
+  suite with TRUST_JS_OPT=1 at the new default, 3,739 passed, none failed, 10 ignored. The verifier sweeps at both modes
+  are those of rule B's and the carry's checks on the same engine code.
+- Not done here and owed at the stage's end: Test262 and difftest with the tier on at the
+  new default; the timed Octane table against the reference engines.
+- Behind at graph, recorded with their causes in rule B's record: GBEMU +0.17% and Splay
+  +0.12% (context switches around operations not lowered in inlined frames). Open from the
+  flip's preparation: the exit limit at graph (owner question 4: JSC's 100 or SpiderMonkey's
+  10 << R), and the inliner's budget.
