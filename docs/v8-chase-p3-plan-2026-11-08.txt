@@ -6979,3 +6979,22 @@ the run), spread = the three rounds' range of cycles at graph.
   not done for this table yet. Its cycles row at 5 runs (-3.5%) carries the same draw.
 - The table is the owner's to decide the flip on; the coordinator's suggestion is to decide
   when the three rows are attributed.
+
+The owner's decisions of 2026-11-19 (owner question 7, made decidable by
+target/p3/stage3/f4-impl/design-note.txt, and the flip, on the table above).
+- The tier may depend on a global property staying unchanged: a state per property that the
+  runtime moves one way (constant until its first change, then never folded again), a list of
+  the codes that folded it, and their invalidation when it changes, as V8, JSC and
+  SpiderMonkey do. Ceiling beyond the loop hoist: -6.8 points of Mandreel, about -5% of
+  Richards. The same mechanism is to serve stable shapes through calls later (75% of
+  Richards', 97% of DeltaBlue's and 66% of RayTrace's repeated shape checks sit in loops that
+  call).
+- It may also depend on a typed array's buffer not being detached or resized, in V8's form
+  (one engine-wide state), built after the first dependency is landed and measured: a ceiling
+  of -4.5 points more of Mandreel and nothing elsewhere; taken out if Mandreel does not gain.
+- Running code learns of an invalidation by a test after calls, where the tier already tests
+  the global object's epoch (0.2 to 0.8 points of the gain given back); V8's return-address
+  exit is decided later on numbers, on the same runtime side.
+- The flip: graph becomes the default after the register allocator's rule B lands, on the
+  table taken again on that main; GBEMU's and Splay's remaining instruction gaps are recorded
+  with their causes and their two follow-on pieces, not waited for.

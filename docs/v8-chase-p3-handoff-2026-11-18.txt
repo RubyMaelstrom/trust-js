@@ -427,3 +427,18 @@ again. Scratch briefs kept under /tmp for stage 2's steps were lost; stage 3's a
 - The heat guard tripped once that night (03:05, 86.7 C, 48 processes paused for 53 minutes,
   cleared at 66.8 C). With everything paused the machine still read 87 to 93 C under the
   owner's nightly GPU job alone.
+- THE OWNER ANSWERED on 2026-11-19 (the plan's record "The owner's decisions of 2026-11-19"):
+  question 7 is yes (dependencies on global properties, as the three engines have them), a
+  dependency on a typed array's buffer not being detached or resized follows in V8's
+  engine-wide form once the first is landed and measured, and running code learns of an
+  invalidation by a test where the tier already tests after calls; the flip happens after the
+  register allocator's rule B lands (the plan's flip table and
+  target/p3/stage3/behind-impl/report.txt), on the table retaken on that main.
+- In flight on the morning of 2026-11-19 beside what is listed above: the register
+  allocator's rule B (a value that only exits read does not compete for a register;
+  briefs/regb-landing.txt, branch p3-s3-regb, evidence behind-impl): a candidate measures
+  about -3% instructions and -5% cycles on zlib and Mandreel in both modes, Crypto -1.4% at
+  graph, with no row worse; its landing form is being made. The tag test and the global-read
+  hoist (its miscompile fixed by the rule that a loop's stores include every inlined
+  frame's) are stacked on branch p3-s3-stack under the coordinator's checks and land
+  together.
