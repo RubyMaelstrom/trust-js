@@ -50,8 +50,8 @@ Read first, in this order:
 
 ## The repository's state
 
-- (For the state on 2026-11-19 read the last section, "2026-11-19, midday": origin/main is
-  6496547c there and local main is ahead of it again.) On the morning of 2026-11-18:
+- (For the current state read the LAST dated section of this note: origin/main is 6496547c
+  there and local main is ahead of it again.) On the morning of 2026-11-18:
   origin/main is a5411040 (stage 2's exit record). The working main is 28e60d11, 154 commits ahead
   and NOT PUSHED: all of stage 3 so far exists only in the coordinator's checkout
   (/big/Code/trust-js on the machine called Crystal). Pushes happen when the owner asks. Until
@@ -640,3 +640,76 @@ Read this section before "2026-11-19, midday": where they differ, this one holds
   verifier sweep and the tier's modules in ONE configuration for a tier change (that module
   run is what would have caught ce0e88f8's case before it landed); a whole-library run only
   for a change to every program's default path; Test262 and difftest in the background.
+
+## 2026-11-19, midnight
+
+Read this section before "2026-11-19, 18:00": where they differ, this one holds.
+
+- LANDED ON LOCAL MAIN since 18:00, each with its record in the plan (search the commit id):
+  - Dependencies on global properties ("F4 part 2"): d10637a0 (layer 2: dependents, the
+    validity word, the Invalidated exit), ef27a756 (layer 3: a constant global's Number
+    folded; Richards -4.7% at graph), da46715b and 09334385 (the fuses kept with the heap;
+    the store path back to one thread-local read), 804ff7d8 (layer 4a: a typed array held
+    in a global, its identity and kind; Mandreel -6.3% at graph), b5b97df1 (a function held
+    in a global, its callee guard not built; Mandreel -4.8%, Earley-Boyer -0.6%).
+  - The polymorphic named store: 719b0fb9 and af8bd058 (Splay -4.7%, Box2D -1.8%, GBEMU
+    -1.1% at graph).
+  - The megamorphic line: 2e725cf9 (reads probe the engine-wide cache from generated code
+    at megamorphic sites; TypeScript -3.8% at graph, -3.3% tier off) and 52bc29a4 (a store
+    table of its own; TypeScript -9.2% / -6.6%).
+  - Built-in accessor getters: 7f61ea68 and bbb86d40 (typed arrays fill a read's ways, a
+    native getter is called directly, a typed array's length, byteLength and byteOffset
+    answer in line on ARM64: 785 instructions a read to 129; GBEMU -46.9% at graph and
+    -27.0% with the tier off at 200 runs).
+  - 6f76dcad: a BUILD FIX. 804ff7d8 made the shared builder call a function of the ARM64
+    back end's register allocator, so x86-64 and Windows did not build from that commit
+    until this one. Lesson, now a rule for every landing: a change to a file the other
+    architectures compile carries the x86-64 host's check, clippy and Windows check before
+    it lands (three to five minutes; AGENTS.md's Testing section already said so).
+- origin/main is still 6496547c; local main is about 118 commits ahead and NOT PUSHED.
+- Validated in the background on main during the day: Test262 with the tier on and eager at
+  graph 53,572 of 53,575 (three runs), difftest 138 agree in three configurations, the whole
+  library suite with the tier off clean at af8bd058. A Test262 and difftest run of 93ee15f6
+  and a library run of the getter line's code were started at 23:35; their results go into
+  the plan. Still owed from the flip: the timed Octane table against the reference engines.
+- IN FLIGHT, each with a brief under target/p3/stage3/briefs/ and STATUS.txt / NEXT.txt in
+  its evidence directory:
+  1. Dependencies, next pieces (f4-part2-typed.txt; branch p3-s3-f4p6; evidence f4p2-impl):
+     the length of a folded typed array under an engine-wide "no buffer was ever detached"
+     bit (decided: V8's form, the length only); then the data test of a typed element
+     access, which is 10.2% of Mandreel's instructions and mostly repeats a test that no
+     effect ended (the builder loses the fact at merges and loop headers): a split, the
+     exemplars, a note, then the build.
+  2. The graph line (graph-piece3b.txt; branch p3-s3-gp3; evidence gp3-impl): first a
+     collector commit, the compile-install path out of line from jit_interrupt (that
+     function's 5.4 KB frame is on the stack at every collection it triggers and its stale
+     words kept garbage alive; any change to a compile's types moved Djot by 0.25%); then
+     `instanceof` in the graph (Earley-Boyer -7.9% at graph, measured, held for its tests and
+     a tier-off cost being removed); then key-checked ways (a first commit was defective:
+     its shape check refused every Array receiver; the fix is a set of admitted receiver
+     kinds on CheckShape and CheckProto); then GetMethodElem.
+  3. The megamorphic line (mega-build4.txt; branch p3-s3-mega2; evidence mega-impl): a cure
+     for what the store table cost Vue (Reflect.set's fast path probes the table first; Vue
+     -0.12% to -0.14%) is built and waits for a flaky test of the line to be fixed; then a
+     per-site threshold (a fifth metadata cell a site: reads turn "probe first" at nine
+     shapes, a store site that keeps missing stops probing for a cool-down, both designed
+     from JSC's numbers), then string-keyed sites and `in`.
+  4. Accessor getters, the rest (getter3.txt; branch p3-s3-getter; evidence getter-impl):
+     native setters called directly, the tier's node for a typed array's length, then the
+     same in line on x86-64.
+  5. Stage 3's step 7, direct calls to known callees (step7-calls.txt; evidence s7-impl):
+     a monomorphic call the tier does not inline calls its callee's current entry through
+     a word the chunk keeps; a function folded from a global is a known callee with no
+     guard (263.5M of Mandreel's 351.6M such calls at 200 runs).
+- The owner's open questions are 4, 8, 11 and 12 to 17 above. 12 to 15 are built on their
+  recommendations meanwhile, each separable; nothing is built for 16 (an accessor kind in
+  the embedding API) or 17 (machine-stack frames for calls between the tier's codes) until
+  they are answered.
+- A measurement lesson of the evening, in the plan's records of the getter and graph lines:
+  a row with the tier OFF that moves by 0.2% to 0.3% on Djot after a change that touches no
+  generated code is the conservative collector keeping a different set of objects because a
+  Rust frame on the stack during collections changed size. Recount with collections
+  deferred (TRUST_JS_GC_NURSERY_BYTES=8000000000 TRUST_JS_GC_MIN_HEAP_BYTES=16000000000)
+  before charging it to the change, and compare what collections keep at allocation counts
+  both binaries share (TRUST_JS_GC_STRESS=100000 TRUST_JS_GC_STRESS_MAJOR=1
+  TRUST_JS_GC_INCREMENTAL=0).
