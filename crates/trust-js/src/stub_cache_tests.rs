@@ -227,3 +227,169 @@ fn two_keys_in_one_store_slot_never_write_each_other() {
     let both = engine.eval(&format!("o.{a} + ',' + o.{b}"), false);
     assert!(matches!(both, Ok(Completion::Value(ref v)) if v == "3,2"));
 }
+
+fn value(engine: &mut Engine, source: &str) -> String {
+    match engine.eval(source, false).expect("fixture parses") {
+        Completion::Value(v) => v,
+        Completion::Throw { name, message } => panic!("{name}: {message}\n{source}"),
+    }
+}
+
+/// The store table's probes and hits so far, and Reflect.set's stores that went on to the fill.
+fn reflect_counts() -> ([usize; 2], usize) {
+    (
+        TEST_STORE_TABLE_PROBES.with(Cell::get),
+        TEST_REFLECT_SET_FILLS.with(Cell::get),
+    )
+}
+
+/// Keys from `Object.keys`, which carry their key (`lstr::KEY_MARK`), as a reactive set trap's do.
+const REFLECT_KEYS: &str = "var kx = Object.keys({ x: 0 })[0], kc = Object.keys({ c: 0 })[0];";
+
+/// Reflect.set takes the store table before the store path's scratch ways, once a store: a miss
+/// probes the table once and hands the entry it met to the fill (no second probe), and the store
+/// after it, of the same shape, key and prototype, is the table's (no fill). Generated code's
+/// native call reaches the resolution (`native_stub_call`); the VM's call of a native does not.
+#[test]
+fn reflect_set_takes_the_store_table_once_before_its_scratch_ways() {
+    crate::opt::pin_tier_off_for_test();
+    let tier = crate::bytecode::Tier::Jit;
+    let mut engine = Engine::new();
+    engine.set_tier(tier);
+    engine.set_tier_threshold(0);
+    eval(&mut engine, REFLECT_KEYS);
+    eval(
+        &mut engine,
+        "var o = { a: 1, x: 0 }; function rs(o, k, v) { return Reflect.set(o, k, v); }
+         for (var i = 0; i < 64; i++) rs({ ['w' + (i & 3)]: 0, x: 0 }, kx, i);",
+    );
+    let ([probes, hits], fills) = reflect_counts();
+    assert_eq!(value(&mut engine, "rs(o, kx, 1)"), "true");
+    let ([p1, h1], f1) = reflect_counts();
+    assert_eq!(
+        (p1 - probes, h1 - hits, f1 - fills),
+        (1, 0, 1),
+        "{tier:?}: a miss probes once and fills"
+    );
+    assert_eq!(value(&mut engine, "rs(o, kx, 2) + ':' + o.x"), "true:2");
+    let ([p2, h2], f2) = reflect_counts();
+    assert_eq!(
+        (p2 - p1, h2 - h1, f2 - f1),
+        (1, 1, 0),
+        "{tier:?}: the table serves the next store"
+    );
+}
+
+/// Reflect.set's fast path takes only what the full path resolves the same way. A receiver other
+/// than the target (a plain object, or a Proxy of the target whose handler traps
+/// `defineProperty`) gets OrdinarySet's steps on itself, though the table holds the target's
+/// entry; a setter on the chain is called every time (no creation is filled under it); a frozen
+/// target refuses the store. Nothing here moves the process-wide creation epoch, which other
+/// tests' counts read.
+#[test]
+fn reflect_set_s_table_path_keeps_the_receiver_the_chain_and_the_attributes() {
+    crate::opt::pin_tier_off_for_test();
+    for tier in [crate::bytecode::Tier::Bytecode, crate::bytecode::Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        eval(&mut engine, REFLECT_KEYS);
+        eval(
+            &mut engine,
+            "function rs(o, k, v) { return Reflect.set(o, k, v); }
+             function rs4(o, k, v, r) { return Reflect.set(o, k, v, r); }
+             for (var i = 0; i < 64; i++) { var w = { ['w' + (i & 3)]: 0, x: 0 }; rs(w, kx, i); rs4(w, kx, i, w); }
+             var o = { a: 1, x: 0 }; rs(o, kx, 1); rs(o, kx, 2); rs4(o, kx, 2, o);
+             var r = { b: 1, x: 0 }; var defines = 0;
+             var p = new Proxy(o, { defineProperty: function (t, k, d) { defines++; return Reflect.defineProperty(t, k, d); } });",
+        );
+        assert_eq!(
+            value(&mut engine, "rs4(o, kx, 3, r) + ':' + o.x + ':' + r.x"),
+            "true:2:3",
+            "{tier:?}: a plain receiver's own property"
+        );
+        assert_eq!(
+            value(&mut engine, "rs4(o, kx, 4, p) + ':' + o.x + ':' + defines"),
+            "true:4:1",
+            "{tier:?}: the receiver Proxy's defineProperty trap"
+        );
+        eval(
+            &mut engine,
+            "var P = { q: 1 }, seen = [];
+             for (var i = 0; i < 3; i++) rs(Object.create(P), kc, i);",
+        );
+        let created = value(
+            &mut engine,
+            "var n = Object.create(P); rs(n, kc, 7) + ':' + Object.keys(n).join(',')",
+        );
+        assert_eq!(created, "true:c", "{tier:?}: a creation the table serves");
+        assert_eq!(
+            value(
+                &mut engine,
+                "var S = { set c(v) { seen.push(v); } };
+                 for (var i = 0; i < 3; i++) rs(Object.create(S), kc, 8 + i);
+                 var m = Object.create(S); rs(m, kc, 11) + ':' + Object.keys(m).length + ':' + seen.join(',')"
+            ),
+            "true:0:8,9,10,11",
+            "{tier:?}: a setter on the chain is called, every time"
+        );
+        assert_eq!(
+            value(&mut engine, "Object.freeze(o); rs(o, kx, 5) + ':' + o.x"),
+            "false:4",
+            "{tier:?}: a frozen target refuses"
+        );
+    }
+}
+
+/// The table's hit takes an entry for its own receiver shape and prototype alone. The slot mixes
+/// in both (`store_slot`), but two triples can share one: each collision is made here by copying
+/// one triple's real entry into the slot the other's probe reads. An update entry of another
+/// shape (its `x` elsewhere) is not applied; a creation entry under another prototype is not
+/// taken, and that prototype's setter for the key is called. Reflect.set's probe is the Rust
+/// path's alone.
+#[test]
+fn reflect_set_s_table_hit_takes_its_own_shape_and_prototype_alone() {
+    crate::opt::pin_tier_off_for_test();
+    let mut engine = Engine::new();
+    engine.set_tier(crate::bytecode::Tier::Jit);
+    engine.set_tier_threshold(0);
+    eval(&mut engine, REFLECT_KEYS);
+    eval(
+        &mut engine,
+        "function rs(o, k, v) { return Reflect.set(o, k, v); }
+         for (var i = 0; i < 64; i++) rs({ ['w' + (i & 3)]: 0, x: 0 }, kx, i);
+         var seen = [], A = { p: 0, x: 0 }, B = { x: 0, q: 0 };
+         var Pa = { q: 1 }, Pb = { set c(v) { seen.push(v); } };
+         var ea = Object.create(Pa), eb = Object.create(Pb);
+         rs(A, kx, 1); rs(A, kx, 2); rs(Object.create(Pa), kc, 1); rs(Object.create(Pa), kc, 2);",
+    );
+    let triple = |engine: &mut Engine, name: &str| {
+        let o = object(engine, name);
+        let shape = o.borrow().props.shape();
+        (shape, proto_of(&o))
+    };
+    let collide = |engine: &mut Engine, from: &str, to: &str, key: &str| {
+        let key = crate::atom::PropKey::from_text(key);
+        let ((fs, fp), (ts, tp)) = (triple(engine, from), triple(engine, to));
+        let entry = engine
+            .interp
+            .store_cache_get(fs, key, fp)
+            .expect("the first triple's entry");
+        engine.interp.store_cache[store_slot(ts, key, tp)].set(entry);
+    };
+    collide(&mut engine, "A", "B", "x");
+    assert_eq!(
+        value(&mut engine, "rs(B, kx, 5) + ':' + B.x + ':' + B.q"),
+        "true:5:0",
+        "an update entry of another shape in the slot"
+    );
+    collide(&mut engine, "ea", "eb", "c");
+    assert_eq!(
+        value(
+            &mut engine,
+            "var m = Object.create(Pb); rs(m, kc, 7) + ':' + Object.keys(m).length + ':' + seen.join(',')"
+        ),
+        "true:0:7",
+        "a creation entry under another prototype in the slot"
+    );
+}

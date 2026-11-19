@@ -4546,6 +4546,10 @@ thread_local! {
     /// probe a miss (`Interp::store_probe_token`).
     pub(crate) static TEST_STORE_TABLE_PROBES: std::cell::Cell<[usize; 2]> =
         const { std::cell::Cell::new([0, 0]) };
+    /// Reflect.set's stores that the store table did not serve (`Interp::reflect_set_resolution`
+    /// went on to the store path's fill).
+    pub(crate) static TEST_REFLECT_SET_FILLS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// The store table's index for a (receiver shape, key, prototype) triple (`Interp::store_cache`):
@@ -4562,8 +4566,9 @@ pub(crate) fn store_slot(shape: u32, key: crate::atom::PropKey, proto: usize) ->
 
 impl Interp {
     /// The store table's entry for a store of `key` into a receiver of `shape` under the
-    /// prototype `proto` (`Gc::as_ptr`, 0 for none), when it holds that key.
-    #[inline]
+    /// prototype `proto` (`Gc::as_ptr`, 0 for none), when it holds that key. The tests' reading of
+    /// the table; the store path's probe is `Interp::store_table_commit`.
+    #[cfg(test)]
     pub(crate) fn store_cache_get(
         &self,
         shape: u32,
@@ -10932,9 +10937,29 @@ impl Interp {
                 .ok()
                 .map(Value::Bool);
         }
+        // The store table first (the megamorphic line), before the store path's scratch ways: a
+        // Reflect.set has no site, so every one is a megamorphic store (Vue's reactive set trap
+        // makes one per reactive write), and the scratch ways' fill, which learns nothing a later
+        // call keeps, cost each about 140 instructions more (V8's ReflectSet, builtins-reflect.cc:
+        // 72-99, and JSC's reflectObjectSet, runtime/ReflectObject.cpp:244-245, take their generic
+        // [[Set]]; this fast path is the engine's own). The cases are the full path's: an ordinary
+        // receiver of the target's own [[Set]] (the receiver forwards, above). A miss hands the
+        // entry it met to the fill as the store helper hands its token: one probe a store.
+        let probed = {
+            let mut b = object.borrow_mut();
+            if !b.kind.is_ordinary() {
+                return None;
+            }
+            match self.store_table_commit(&mut b, key, &value) {
+                Ok(_) => return Some(Value::Bool(true)),
+                Err(met) => met,
+            }
+        };
+        #[cfg(test)]
+        TEST_REFLECT_SET_FILLS.with(|c| c.set(c.get() + 1));
         let scratch = [const { std::cell::Cell::new(crate::bytecode::IcState::EMPTY) };
             crate::bytecode::PROP_IC_WAYS];
-        match self.try_ic_set::<false>(object, key, &value, &scratch[0], 0) {
+        match self.try_ic_set::<false>(object, key, &value, &scratch[0], probed) {
             IcSet::Stored => Some(Value::Bool(true)),
             _ => None,
         }
@@ -11879,6 +11904,58 @@ impl Interp {
     /// [[Set]] reaches (`IC_ACCESSOR`), whose setter the caller calls (a profiled store leaves
     /// accessors to the canonical [[Set]]). `Miss` means "take the slow path", with nothing
     /// written.
+    /// The store table's entry for a store of `key` with `v` into `b` (an ordinary, ic-plain
+    /// receiver), committed when it validates: an update of an own writable data property (the
+    /// shape proves the slot and its attributes; the live checks kept, as the ways keep them) or a
+    /// creation (the prototype's identity and the creation epoch re-prove the fill's chain walk,
+    /// as a creation way's do). Every entry was filled under R2 (`may_store_in_line`), so a hit
+    /// stores with no report, as a way does. `Ok` is the committed state; `Err` is the entry
+    /// probed (its address, bit 0 set), which a caller that goes on to the fill passes as
+    /// `probed`, as the store helper passes its token, so the table is probed once a store. The
+    /// one rule for the table's hit: the store path's (`Interp::try_ic_set`) and Reflect.set's
+    /// (`Interp::reflect_set_resolution`).
+    #[inline(always)]
+    fn store_table_commit(
+        &self,
+        b: &mut std::cell::RefMut<'_, crate::value::Object>,
+        key: crate::atom::PropKey,
+        v: &Value,
+    ) -> Result<crate::bytecode::IcState, usize> {
+        use crate::bytecode::IC_CREATE;
+        let shape = b.props.shape();
+        let proto_ptr = b.proto.as_ref().map_or(0, |p| Gc::as_ptr(p) as usize);
+        #[cfg(test)]
+        TEST_STORE_TABLE_PROBES.with(|c| c.set([c.get()[0] + 1, c.get()[1]]));
+        let slot = store_slot(shape, key, proto_ptr);
+        let met = &self.store_cache[slot] as *const _ as usize | 1;
+        let entry = self.store_cache[slot].get();
+        if entry.key != Some(key) || entry.st.recv_shape != shape {
+            return Err(met);
+        }
+        let st = entry.st;
+        if st.depth == 0 {
+            if let Some(p) = b.props.property_at(st.slot as usize) {
+                if !p.accessor() && p.writable() {
+                    b.props.set_value_at_proven(st.slot as usize, *v);
+                    #[cfg(test)]
+                    TEST_STORE_TABLE_PROBES.with(|c| c.set([c.get()[0], c.get()[1] + 1]));
+                    return Ok(st);
+                }
+            }
+        } else if st.depth == IC_CREATE && b.extensible() {
+            let epoch = crate::value::proto_epoch();
+            let cached_proto = (((st.mid2_shape as u64) << 32) | st.slot as u64) as usize;
+            if st.mid_shape == epoch && epoch != u32::MAX && cached_proto == proto_ptr {
+                b.props
+                    .append_new(key, Property::plain(*v), st.holder_shape);
+                #[cfg(test)]
+                TEST_STORE_TABLE_PROBES.with(|c| c.set([c.get()[0], c.get()[1] + 1]));
+                return Ok(st);
+            }
+        }
+        Err(met)
+    }
+
     pub(crate) fn try_ic_set<const ACCESSORS: bool>(
         &mut self,
         o: &Gc,
@@ -11954,38 +12031,9 @@ impl Interp {
         // Skipping a probe that would have hit only loses that hit's fast path: the fill below
         // stores by the full lookup and writes the same entry.
         if probed == 0 {
-            use crate::bytecode::IC_CREATE;
-            let shape = b.props.shape();
-            let proto_ptr = b.proto.as_ref().map_or(0, |p| Gc::as_ptr(p) as usize);
-            #[cfg(test)]
-            TEST_STORE_TABLE_PROBES.with(|c| c.set([c.get()[0] + 1, c.get()[1]]));
-            if let Some(e) = self
-                .store_cache_get(shape, key, proto_ptr)
-                .filter(|e| e.st.recv_shape == shape)
-            {
-                let st = e.st;
-                if st.depth == 0 {
-                    if let Some(p) = b.props.property_at(st.slot as usize) {
-                        if !p.accessor() && p.writable() {
-                            b.props.set_value_at_proven(st.slot as usize, *v);
-                            self.ic_insert(cache, st);
-                            #[cfg(test)]
-                            TEST_STORE_TABLE_PROBES.with(|c| c.set([c.get()[0], c.get()[1] + 1]));
-                            return IcSet::Stored;
-                        }
-                    }
-                } else if st.depth == IC_CREATE && b.extensible() {
-                    let epoch = crate::value::proto_epoch();
-                    let cached_proto = (((st.mid2_shape as u64) << 32) | st.slot as u64) as usize;
-                    if st.mid_shape == epoch && epoch != u32::MAX && cached_proto == proto_ptr {
-                        b.props
-                            .append_new(key, Property::plain(*v), st.holder_shape);
-                        self.ic_insert(cache, st);
-                        #[cfg(test)]
-                        TEST_STORE_TABLE_PROBES.with(|c| c.set([c.get()[0], c.get()[1] + 1]));
-                        return IcSet::Stored;
-                    }
-                }
+            if let Ok(st) = self.store_table_commit(&mut b, key, v) {
+                self.ic_insert(cache, st);
+                return IcSet::Stored;
             }
         }
         // Accessor ways (see `IC_ACCESSOR`), every way: the chain's shapes prove that the
