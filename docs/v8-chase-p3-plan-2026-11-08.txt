@@ -6919,3 +6919,18 @@ randomized runs, piece B's in 2 of 10, an engine of three days earlier the highe
   lives or not) waits on that count. A few other sites meet a dead callee the same way
   (GBEMU 1, PdfJS 3, TypeScript 10), and the planner drops a whole site for one dead callee
   (bytecode.rs:11375): recorded, not changed.
+- Counted since (the same agent; tsmode-impl/report.txt sections 6 and 7, creach-join.txt). The
+  code-guarded way has little reach on these workloads in the one-function form V8 has: 0.02%
+  to 0.08% of the Octane benchmarks at 200 runs (Earley-Boyer, PdfJS, Box2D; nine have no such
+  site), Vue's steady state 0.17%, Djot's 0.87%, by calls at 150 instructions each, not
+  measured a site. React's such calls are piece B's. GBEMU's 0.75% is one dispatch site that
+  calls five functions, the largest over the inliner's size limit, and would need polymorphic
+  closure ways. Recorded, not built; Djot or the polymorphic form would reopen it, and it
+  would reuse piece B's frame with the environment loaded from the callee and a guard of the
+  code. The smaller rule is approved and written up to be built (section 7: at a
+  reoptimization a kept way is not taken where its site's cache holds another closure of its
+  function or the site's code hint is set, whether its callee lives or not; a two-engine test;
+  its measure is that the tier's masked logs no longer differ between randomized runs on
+  TypeScript, GBEMU and PdfJS). Not built yet: nobody is on it. After it a dead way whose site
+  met no other closure of its function still follows liveness, and so does the planner's
+  whole-site skip.
