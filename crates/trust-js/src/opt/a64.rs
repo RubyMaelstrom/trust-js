@@ -2082,6 +2082,12 @@ impl Gen<'_> {
     }
 
     fn gp_dst(&self, n: NodeIx) -> u32 {
+        // A constant's home is its value: each use materializes it (`regalloc::rematerializable`),
+        // so no lowering writes one, and a write here would be dead code at every such node.
+        debug_assert!(
+            self.home(n) != Home::Const,
+            "node {n:?} has a constant's home: nothing writes it"
+        );
         match self.home(n) {
             Home::Gp(r) => u32::from(r),
             _ => X9,

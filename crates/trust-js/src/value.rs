@@ -3413,7 +3413,8 @@ pub(crate) struct GcState {
     /// that `active_global_word`'s pointer never outlives it.
     active_global: RefCell<Option<std::sync::Arc<crate::object_fuse::ObjectFuse>>>,
     /// That fuse's map address and the fuse, which a watched global's reported write reads
-    /// through the active Agent's tag (`active_global_fuse`): whichever Agent the thread entered
+    /// through the active Agent's (`active_global_fuse`, its copy `ACTIVE_GLOBAL_WORD` beside
+    /// the Agent's tag): whichever Agent the thread entered
     /// (an execution entry, a host's guard), its global's writes find their own fuse with no
     /// registry and no lock, as SpiderMonkey keeps its object fuses per zone
     /// (cx->zone()->objectFuses, vm/Watchtower.cpp:760).
@@ -5446,6 +5447,11 @@ thread_local! {
     /// Realm implementation can share Symbols while owning a distinct heap, hence both pointers
     /// participate in the tag.
     static ACTIVE_AGENT_TAG: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    /// The `active_global_word` of the heap the tag names ((0, null) while it names none), set
+    /// wherever the tag is set and wherever that heap's word is set: a watched global's reported
+    /// write finds its fuse with one thread-local read (F4 part 2; `active_global_fuse`).
+    static ACTIVE_GLOBAL_WORD: Cell<(usize, *const crate::object_fuse::ObjectFuse)> =
+        const { Cell::new((0, std::ptr::null())) };
     #[cfg(test)]
     static ACTIVE_AGENT_SLOW_SWITCHES: Cell<u64> = const { Cell::new(0) };
 }
@@ -5882,6 +5888,7 @@ fn activate_other_agent(heap: &GcHeap, symbols: &SymbolAgent, next: (usize, usiz
         // The tag names a heap only while it lives (see `with_agent_heap`): it moves first, and
         // the replaced heap, which the slot may hold last, drops once both name the new one.
         tag.set(next);
+        ACTIVE_GLOBAL_WORD.set(heap.active_global_word.get());
         let replaced = (
             ACTIVE_GC_HEAP.with(|active| active.borrow_mut().replace(heap.clone())),
             ACTIVE_SYMBOL_AGENT.with(|active| active.borrow_mut().replace(symbols.clone())),
@@ -5911,6 +5918,10 @@ impl Drop for AgentActivationGuard {
         };
         // As in `activate_agent`: the tag first, the replaced heap dropped last.
         ACTIVE_AGENT_TAG.with(|active| active.set(tag));
+        ACTIVE_GLOBAL_WORD.set(match &heap {
+            Some(heap) if tag.0 != 0 => heap.active_global_word.get(),
+            _ => (0, std::ptr::null()),
+        });
         let replaced = (
             ACTIVE_GC_HEAP.with(|active| std::mem::replace(&mut *active.borrow_mut(), heap)),
             ACTIVE_SYMBOL_AGENT
@@ -5958,6 +5969,7 @@ pub(crate) fn deactivate_agent_if(heap: &GcHeap, symbols: &SymbolAgent) {
         if tag.get() == current {
             // As in `activate_agent`: the tag first, the heap dropped last.
             tag.set((0, 0));
+            ACTIVE_GLOBAL_WORD.set((0, std::ptr::null()));
             let taken = (
                 ACTIVE_GC_HEAP.with(|active| active.borrow_mut().take()),
                 ACTIVE_SYMBOL_AGENT.with(|active| active.borrow_mut().take()),
@@ -5988,10 +6000,14 @@ pub(crate) fn set_active_global(
     fuse: Option<&std::sync::Arc<crate::object_fuse::ObjectFuse>>,
 ) {
     let replaced = heap.active_global.replace(fuse.cloned());
-    heap.active_global_word
-        .set(fuse.map_or((0, std::ptr::null()), |fuse| {
-            (fuse.props(), std::sync::Arc::as_ptr(fuse))
-        }));
+    let word = fuse.map_or((0, std::ptr::null()), |fuse| {
+        (fuse.props(), std::sync::Arc::as_ptr(fuse))
+    });
+    heap.active_global_word.set(word);
+    // The tag's copy, when the tag names this heap (another heap's is read as the tag moves).
+    if ACTIVE_AGENT_TAG.with(Cell::get).0 == Rc::as_ptr(heap) as usize {
+        ACTIVE_GLOBAL_WORD.set(word);
+    }
     drop(replaced);
 }
 
@@ -6008,10 +6024,23 @@ pub(crate) fn clear_active_global_of(
 }
 
 /// The active Agent's active global fuse: its map's address and the fuse (null for none), which
-/// the Agent's heap holds (see `GcState::active_global_word`).
+/// the Agent's heap holds (see `GcState::active_global_word`), from its copy beside the Agent's
+/// tag: one thread-local read. With no Agent active it is none, and a report takes the registry.
 #[inline]
 pub(crate) fn active_global_fuse() -> (usize, *const crate::object_fuse::ObjectFuse) {
-    with_agent_heap(|state| state.active_global_word.get())
+    let word = ACTIVE_GLOBAL_WORD.get();
+    #[cfg(debug_assertions)]
+    {
+        let state = ACTIVE_AGENT_TAG.with(|tag| tag.get().0) as *const GcState;
+        // SAFETY: as in `with_agent_heap`: the tag names a heap the active-heap cell holds.
+        let named = (!state.is_null()).then(|| unsafe { &*state }.active_global_word.get());
+        debug_assert_eq!(
+            word,
+            named.unwrap_or((0, std::ptr::null())),
+            "the active global word's copy differs from the active Agent's heap's"
+        );
+    }
+    word
 }
 
 fn unowned_gc_heap() -> GcHeap {
@@ -6041,6 +6070,7 @@ impl std::ops::Deref for ActiveHeapCell {
 impl Drop for ActiveHeapCell {
     fn drop(&mut self) {
         let _ = ACTIVE_AGENT_TAG.try_with(|tag| tag.set((0, 0)));
+        let _ = ACTIVE_GLOBAL_WORD.try_with(|word| word.set((0, std::ptr::null())));
     }
 }
 
