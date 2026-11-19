@@ -167,7 +167,10 @@ later. Count the hours a check plan implies before starting it.
   `current_exe()`). A revision exported with `git archive` needs a fresh target
   directory, because its old file times make cargo reuse stale artifacts. `cargo test |
   grep | head && git commit` commits on a failed test. Never edit a shell script that is
-  still running.
+  still running. A test that asserts an exact count (helper calls, cache
+  hits) which depends on a process-wide cache or epoch runs its body in a child process
+  (`jit::construct_tests::run_alone`): concurrent tests move that state, and such tests
+  failed one run in ten until they were isolated.
 
 ## Documentation
 
