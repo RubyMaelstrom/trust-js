@@ -8361,7 +8361,7 @@ report.txt, the agent's; the coordinator's check target/p3/stage3/rs-review).
   process of the test binary (jit_construct_tests.rs's run_alone), exit 20 of 20.
 
 The megamorphic line's count-asserting tests run in a child process (8df2fe98; landed
-2026-11-20 00:12; tests only; target/p3/stage3/mega-impl/p1g/item0-report.txt): fourteen
+2026-11-20 00:07; tests only; target/p3/stage3/mega-impl/p1g/item0-report.txt): fourteen
 tests that assert exact counts of helper calls, table probes or fills (six of
 jit::mega_store_tests, six of jit::mega_read_tests, two of Reflect.set's) run their body
 through jit::construct_tests::run_alone, where no concurrent test moves the process-wide
@@ -8374,6 +8374,6 @@ state at once. The rule for new tests of this kind: a test that asserts an exact
 depending on a process-wide cache or epoch runs alone in a child.
 
 Validation of the Reflect.set commit's engine (7cf4f19a's code), the megamorphic line's own
-runs (target/p3/stage3/mega-impl/p1f/chk/status.txt, t262.log; ended 2026-11-20 00:20): the
+runs (target/p3/stage3/mega-impl/p1f/chk/status.txt, t262.log; reported 2026-11-20 00:09): the
 whole library with the tier off 3,847 passed, 0 failed; the tier's modules with
 TRUST_JS_OPT=1 701 passed, 0 failed; Test262 eager 53,572 of 53,575.
