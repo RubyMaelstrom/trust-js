@@ -6941,3 +6941,41 @@ randomized runs, piece B's in 2 of 10, an engine of three days earlier the highe
   stress 18 of the 20 by-literal tests passed in a six-hour window and none failed; one of the
   two unfinished passed in the coordinator's stress run, the other
   (no_entry_outlives_its_by_literal_frame) has never finished in that mode.
+
+The flip's table, taken again on main with piece B (2026-11-19; target/p3/stage3/flip-review:
+flip-table.sh and flip-cycles-checks2.sh, c5-*.out, flip-table.log, flip-cycles.out; one binary,
+target/p2/lto/661a2ba5, which is main's engine code; graph against the splice). Instructions at
+fixed addresses, 5 runs the median of three and 200 runs one run; cycles and instructions on
+one X925 core at randomized addresses, three rounds with the modes alternating, the machine
+loaded by other work (load 17 to 25, the clock between 1.38 and 2.47 GHz, no heat trip inside
+the run), spread = the three rounds' range of cycles at graph.
+                      instructions          cycles   (spread)
+                      5 runs   200 runs     200 runs
+  React steady state  -38.9%                -41.9%   (0.2%)
+  React fixture       -19.6%
+  Richards            -19.8%    -9.9%       -14.1%   (0.0%)
+  DeltaBlue           -11.6%   -15.9%       -24.3%   (0.4%)
+  Box2D                -2.5%    -2.2%        -2.1%   (0.4%)
+  Djot fixture/steady  -1.9%    -1.1%        -1.6%   (1.2%)
+  Vue fixture/steady   -1.1%    -1.1%        -1.3%   (0.9%)
+  Earley-Boyer         -1.4%    -0.9%        -2.2%   (0.5%)   instructions with the marker off
+  RayTrace             -9.3%    -0.3%        -1.6%   (0.4%)
+  TypeScript           -1.5%    -1.1%        -3.5%   (0.6%)   5 runs; not read by mode yet
+  Mandreel             -0.3%    -0.35%       -0.5%   (0.3%)   cycles at 5 runs
+  PdfJS                -0.7%    -0.1%        -0.3%   (0.9%)
+  RegExp, Navier-Stokes, zlib, CodeLoad: 0.0% in instructions; cycles within their spread
+  GBEMU                -1.8%    +0.18%       -0.0%   (0.3%)
+  Splay                +0.50%   +0.14%       -0.3%   (1.8%)   instructions with the marker off
+  Crypto               -0.9%    +0.66%       +0.72%  (0.0%)
+- Graph is ahead or level on eighteen of twenty-one workloads. Behind: Crypto at 200 runs in
+  instructions and cycles alike; GBEMU by 0.18% of instructions with its cycles level; Splay
+  with the incremental marker off, by half a per cent of instructions at 5 runs and a seventh
+  at 200. None of the three is attributed yet: an earlier partial look put Crypto's extra
+  instructions in montReduce's tier code, whose inner loop calls a function that is spliced
+  in one mode and built as a frame in the other. An agent has the three rows now
+  (target/p3/stage3/briefs/graph-behind.txt): Crypto to the instruction with a proposal, GBEMU
+  by site, Splay split into the collector's and the mutator's work.
+- TypeScript's rows are to be read by the mutator's instructions (its two collector modes);
+  not done for this table yet. Its cycles row at 5 runs (-3.5%) carries the same draw.
+- The table is the owner's to decide the flip on; the coordinator's suggestion is to decide
+  when the three rows are attributed.
