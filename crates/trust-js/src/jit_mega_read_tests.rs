@@ -104,6 +104,13 @@ const STEPS: [&str; 14] = [
     "run(rx, 16)",
 ];
 
+/// Whether this process runs the test `name` of this module alone (a child of the test binary;
+/// `construct_tests::run_alone`), which every test here that counts native and checked reads
+/// does: a count is exact only where no other test's engine moves process-wide state under it.
+fn alone(name: &str) -> bool {
+    super::construct_tests::run_alone(&format!("jit::mega_read_tests::{name}"))
+}
+
 /// Each step's value; a read step (the first five) runs twice, and its second pass must be all
 /// native: a site's entries never take each other's slots (one key, distinct shapes), but another
 /// site's entry may have taken one since the warm pass (eight shapes and seven keys share 4096
@@ -133,6 +140,9 @@ fn a_megamorphic_read_is_served_by_the_engine_wide_cache_in_generated_code() {
     // Counts the template JIT's reads: with the tier on, `run`'s loop would reach its
     // checkpoints and the tier's code would make them.
     crate::opt::pin_tier_off_for_test();
+    if !alone("a_megamorphic_read_is_served_by_the_engine_wide_cache_in_generated_code") {
+        return;
+    }
     let mut jit = engine(Tier::Jit);
     let (first, second) = colliding_names(&mut jit);
     let source = program(&first, &second);
@@ -182,6 +192,9 @@ fn two_engines_alive_on_one_thread_each_probe_their_own_table() {
     // The read stubs are process-wide: each engine's reads must find its own interpreter's
     // table through the context, never an address the stub was made with.
     crate::opt::pin_tier_off_for_test();
+    if !alone("two_engines_alive_on_one_thread_each_probe_their_own_table") {
+        return;
+    }
     let mut first = engine(Tier::Jit);
     let mut second = engine(Tier::Jit);
     for engine in [&mut first, &mut second] {
@@ -231,6 +244,9 @@ var r = ""; for (var k = 0; k < 200; k++) r = run(40, k === 199); r"#;
 #[test]
 fn an_inlined_frames_megamorphic_read_hits_the_cache_and_its_miss_names_the_frame() {
     crate::opt::TestSwitches::default().set();
+    if !alone("an_inlined_frames_megamorphic_read_hits_the_cache_and_its_miss_names_the_frame") {
+        return;
+    }
     let mut off = engine(Tier::Jit);
     let expected = eval(&mut off, INLINED);
     assert!(expected.contains("gx"), "{expected}");
@@ -274,6 +290,9 @@ fn an_inlined_frames_megamorphic_read_hits_the_cache_and_its_miss_names_the_fram
 #[test]
 fn a_site_short_of_megamorphic_fills_its_own_ways_and_does_not_probe_the_table() {
     crate::opt::pin_tier_off_for_test();
+    if !alone("a_site_short_of_megamorphic_fills_its_own_ways_and_does_not_probe_the_table") {
+        return;
+    }
     let mut jit = engine(Tier::Jit);
     eval(
         &mut jit,
@@ -346,6 +365,9 @@ fn ways_of(engine: &mut Engine, function: &str) -> ([u32; crate::bytecode::PROP_
 #[test]
 fn a_read_the_cache_serves_in_generated_code_is_promoted_into_its_sites_ways() {
     crate::opt::pin_tier_off_for_test();
+    if !alone("a_read_the_cache_serves_in_generated_code_is_promoted_into_its_sites_ways") {
+        return;
+    }
     for warm in [false, true] {
         let mut jit = engine(Tier::Jit);
         if warm {
@@ -400,6 +422,9 @@ fn a_read_the_cache_serves_in_generated_code_is_promoted_into_its_sites_ways() {
 #[test]
 fn a_megamorphic_sites_key_checked_array_entries_are_served_in_generated_code() {
     crate::opt::pin_tier_off_for_test();
+    if !alone("a_megamorphic_sites_key_checked_array_entries_are_served_in_generated_code") {
+        return;
+    }
     let source = r#"
 var arrs = [];
 for (var i = 0; i < 8; i++) { var a = [1, 2, i]; a["s" + i] = i; arrs.push(a); }

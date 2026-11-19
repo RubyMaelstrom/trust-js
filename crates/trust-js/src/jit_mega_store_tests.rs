@@ -43,36 +43,31 @@ runu(32); runc(32);
 
 const STEPS: [&str; 2] = ["runu(80)", "runc(80)"];
 
-/// Each step's value; with `native`, a pass after a filling pass must make no store helper call.
-/// The creation ways and entries hold the process-wide creation epoch, which concurrent tests move
-/// (a pinned prototype dropped with its engine, a prototype redefined): a pass under which it
-/// moved refills them, so the check takes a filling pass and a checked pass with the epoch still
-/// through both, and runs the two again (bounded) when it was not.
+/// Whether this process runs the test `name` of this module alone (a child of the test binary;
+/// `construct_tests::run_alone`), which every test here that counts store helper calls or table
+/// probes does: the creation ways and entries hold the process-wide creation epoch, which
+/// concurrent tests move (a pinned prototype dropped with its engine, a prototype redefined), and
+/// a store under a moved epoch is a helper call and a refill that the count would read.
+fn alone(name: &str) -> bool {
+    super::construct_tests::run_alone(&format!("jit::mega_store_tests::{name}"))
+}
+
+/// Each step's value; with `native`, each step's second pass must make no store helper call (in
+/// a process of the test's own: `alone`).
 fn steps(engine: &mut Engine, native: Option<&str>) -> Vec<String> {
     let mut values = Vec::new();
     for step in STEPS {
         let first = eval(engine, step);
-        let mut tries = 0;
-        let again = loop {
-            let epoch = crate::value::proto_epoch();
-            assert_eq!(eval(engine, step), first);
-            let (before, filled) = (helpers(), crate::value::proto_epoch());
-            let again = eval(engine, step);
-            assert_eq!(first, again);
-            let still = epoch == filled && filled == crate::value::proto_epoch();
-            if let Some(form) = native {
-                if !still && tries < 16 {
-                    tries += 1;
-                    continue;
-                }
-                assert_eq!(
-                    helpers() - before,
-                    0,
-                    "{form} `{step}`: every store native once the entries are filled"
-                );
-            }
-            break again;
-        };
+        let before = helpers();
+        let again = eval(engine, step);
+        assert_eq!(first, again);
+        if let Some(form) = native {
+            assert_eq!(
+                helpers() - before,
+                0,
+                "{form} `{step}`: every store native once the entries are filled"
+            );
+        }
         values.push(again);
     }
     values
@@ -81,6 +76,9 @@ fn steps(engine: &mut Engine, native: Option<&str>) -> Vec<String> {
 #[test]
 fn a_megamorphic_store_site_is_served_by_the_store_table_in_generated_code() {
     crate::opt::pin_tier_off_for_test();
+    if !alone("a_megamorphic_store_site_is_served_by_the_store_table_in_generated_code") {
+        return;
+    }
     let mut interp = engine(Tier::Interp, false);
     eval(&mut interp, SOURCE);
     let expected = steps(&mut interp, None);
@@ -98,6 +96,9 @@ fn a_megamorphic_store_site_is_served_by_the_store_table_in_generated_code() {
 #[test]
 fn two_engines_alive_on_one_thread_each_store_through_their_own_table() {
     crate::opt::pin_tier_off_for_test();
+    if !alone("two_engines_alive_on_one_thread_each_store_through_their_own_table") {
+        return;
+    }
     let mut a = engine(Tier::Jit, false);
     let mut b = engine(Tier::Jit, false);
     eval(&mut a, SOURCE);
@@ -170,6 +171,9 @@ fn table_probes() -> [usize; 2] {
 #[test]
 fn a_store_the_table_serves_in_generated_code_is_promoted_into_its_sites_ways() {
     crate::opt::pin_tier_off_for_test();
+    if !alone("a_store_the_table_serves_in_generated_code_is_promoted_into_its_sites_ways") {
+        return;
+    }
     for (tier, warm) in [
         (Tier::Jit, false),
         (Tier::Jit, true),
@@ -212,6 +216,9 @@ fn a_store_the_table_serves_in_generated_code_is_promoted_into_its_sites_ways() 
 #[test]
 fn a_store_site_short_of_megamorphic_fills_its_own_ways_and_does_not_probe_the_table() {
     crate::opt::pin_tier_off_for_test();
+    if !alone("a_store_site_short_of_megamorphic_fills_its_own_ways_and_does_not_probe_the_table") {
+        return;
+    }
     let mut jit = engine(Tier::Jit, false);
     eval(
         &mut jit,
@@ -231,6 +238,9 @@ fn a_store_site_short_of_megamorphic_fills_its_own_ways_and_does_not_probe_the_t
 #[test]
 fn a_store_whose_generated_probe_missed_does_not_probe_the_table_again() {
     crate::opt::pin_tier_off_for_test();
+    if !alone("a_store_whose_generated_probe_missed_does_not_probe_the_table_again") {
+        return;
+    }
     let mut jit = engine(Tier::Jit, false);
     eval(
         &mut jit,
@@ -267,6 +277,9 @@ fn a_store_whose_generated_probe_missed_does_not_probe_the_table_again() {
 #[test]
 fn a_stale_store_token_never_suppresses_another_stores_table_hit() {
     crate::opt::pin_tier_off_for_test();
+    if !alone("a_stale_store_token_never_suppresses_another_stores_table_hit") {
+        return;
+    }
     let mut jit = engine(Tier::Jit, false);
     eval(
         &mut jit,

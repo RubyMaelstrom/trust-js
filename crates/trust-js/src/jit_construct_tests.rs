@@ -51,10 +51,13 @@ fn chunk(engine: &mut Engine, name: &str) -> Rc<Chunk> {
     chunk
 }
 
-/// Whether this process runs `test` alone: the parent runs it in a child process, checks that it
-/// passed, and returns false. The call-cache epoch is process-global, so other tests' engines
-/// must not make a site miss while a test takes counts.
-fn run_alone(test: &str) -> bool {
+/// Whether this process runs `test` (its full name) alone: the parent runs it in a child process
+/// of the test binary, checks that it ran and passed, and returns false. A test that asserts an
+/// exact count of helper calls, cache hits, table probes or fills runs its body so: such a count
+/// depends on process-wide state that any concurrent test moves (the call caches' epoch, the
+/// creation epoch, whatever comes next), and in the child nothing else runs. A name that matches
+/// no test fails here (the child must report its one test passed), not passes with nothing run.
+pub(crate) fn run_alone(test: &str) -> bool {
     const CHILD: &str = "TRUST_JS_TEST_CONSTRUCT_CHILD";
     if std::env::var_os(CHILD).is_some() {
         return true;
@@ -64,10 +67,11 @@ fn run_alone(test: &str) -> bool {
         .env(CHILD, "1")
         .output()
         .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        output.status.success(),
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
+        output.status.success() && stdout.contains("1 passed"),
+        "the child {test}: {}\n{stdout}\n{}",
+        output.status,
         String::from_utf8_lossy(&output.stderr)
     );
     false

@@ -250,9 +250,16 @@ const REFLECT_KEYS: &str = "var kx = Object.keys({ x: 0 })[0], kc = Object.keys(
 /// probes the table once and hands the entry it met to the fill (no second probe), and the store
 /// after it, of the same shape, key and prototype, is the table's (no fill). Generated code's
 /// native call reaches the resolution (`native_stub_call`); the VM's call of a native does not.
+/// In a process of its own (`run_alone`): a call whose cache the process-wide call caches' epoch
+/// staled takes the generic call, which reaches no resolution, and its counts would read none.
 #[test]
 fn reflect_set_takes_the_store_table_once_before_its_scratch_ways() {
     crate::opt::pin_tier_off_for_test();
+    if !crate::jit::construct_tests::run_alone(
+        "interpreter::stub_cache_tests::reflect_set_takes_the_store_table_once_before_its_scratch_ways",
+    ) {
+        return;
+    }
     let tier = crate::bytecode::Tier::Jit;
     let mut engine = Engine::new();
     engine.set_tier(tier);
@@ -346,10 +353,16 @@ fn reflect_set_s_table_path_keeps_the_receiver_the_chain_and_the_attributes() {
 /// one triple's real entry into the slot the other's probe reads. An update entry of another
 /// shape (its `x` elsewhere) is not applied; a creation entry under another prototype is not
 /// taken, and that prototype's setter for the key is called. Reflect.set's probe is the Rust
-/// path's alone.
+/// path's alone. In a process of its own (`run_alone`): each real entry is one a Reflect.set call
+/// filled through the resolution, which a call staled by the call caches' epoch does not reach.
 #[test]
 fn reflect_set_s_table_hit_takes_its_own_shape_and_prototype_alone() {
     crate::opt::pin_tier_off_for_test();
+    if !crate::jit::construct_tests::run_alone(
+        "interpreter::stub_cache_tests::reflect_set_s_table_hit_takes_its_own_shape_and_prototype_alone",
+    ) {
+        return;
+    }
     let mut engine = Engine::new();
     engine.set_tier(crate::bytecode::Tier::Jit);
     engine.set_tier_threshold(0);

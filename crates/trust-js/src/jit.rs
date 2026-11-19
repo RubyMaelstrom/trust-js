@@ -132,7 +132,7 @@ mod setter_call_tests;
 
 #[cfg(test)]
 #[path = "jit_construct_tests.rs"]
-mod construct_tests;
+pub(crate) mod construct_tests;
 
 #[cfg(test)]
 #[path = "jit_osr_entry_tests.rs"]
