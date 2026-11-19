@@ -200,3 +200,25 @@ fn a_lexical_global_and_a_stored_field_read_as_the_vm_does() {
          t",
     );
 }
+
+#[test]
+fn a_global_changed_by_a_call_in_the_loop_reads_its_new_value() {
+    // The global is read before the loop (its fact made there) and the loop's call reassigns it:
+    // a loop with a call keeps no global's value through its header.
+    agrees_at_every_switch(&format!(
+        "{HEAPS}
+         var other = new Int32Array(64); for (var k = 0; k < 64; k++) other[k] = 5000 + k;
+         function swap() {{ var t = heap32; heap32 = other; other = t; return 0; }}
+         function run(n) {{
+             var s = heap32[1];
+             for (var i = 0; i < n; i++) {{
+                 s = (s + heap32[i & 63]) | 0;
+                 if ((i & 31) === 31) s = (s + swap()) | 0;
+             }}
+             return s;
+         }}
+         var t = 0;
+         for (var r = 0; r < 300; r++) t = (t * 31 + run(100)) % 1000003;
+         t"
+    ));
+}
