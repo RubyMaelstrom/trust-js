@@ -1449,3 +1449,20 @@ impl Graph {
         &self.states[ix.index()]
     }
 }
+
+/// Whether a node is a constant, which no register holds: a folded global's value among them
+/// where it is a Number (F4 part 2, layer 3), which no collector needs to see; a folded object
+/// keeps a home for its whole range, where the collector finds it (R-2). Read by the builder
+/// (`Builder::constant`) on every architecture and by the register allocator, so it is here and
+/// not in `regalloc`, which only the ARM64 back end compiles.
+pub(crate) fn rematerializable(op: &NodeOp) -> bool {
+    match *op {
+        NodeOp::ConstTagged(_)
+        | NodeOp::ConstF64(_)
+        | NodeOp::ConstI32(_)
+        | NodeOp::ConstBool(_)
+        | NodeOp::ConstEnv(_) => true,
+        NodeOp::FoldedGlobal { word } => ((word >> 48) as u16 & 0x7fff) < 0x7ff9,
+        _ => false,
+    }
+}

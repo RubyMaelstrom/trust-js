@@ -92,20 +92,9 @@ const TYPED_ELEMENT_GP: u64 = (1 << 11) | (1 << 12) | (1 << 13) | (1 << 14) | (1
 /// d1 and d2.
 const TYPED_ELEMENT_FP: u64 = (1 << 1) | (1 << 2);
 
-/// Whether a node is a constant, which no register holds: a folded global's value among them
-/// where it is a Number (F4 part 2, layer 3), which no collector needs to see; a folded object
-/// keeps a home for its whole range, where the collector finds it (R-2).
-pub(crate) fn rematerializable(op: &NodeOp) -> bool {
-    match *op {
-        NodeOp::ConstTagged(_)
-        | NodeOp::ConstF64(_)
-        | NodeOp::ConstI32(_)
-        | NodeOp::ConstBool(_)
-        | NodeOp::ConstEnv(_) => true,
-        NodeOp::FoldedGlobal { word } => ((word >> 48) as u16 & 0x7fff) < 0x7ff9,
-        _ => false,
-    }
-}
+// `rematerializable` lives in `ir` (the builder reads it on every architecture; this module is
+// the ARM64 back end's).
+pub(crate) use super::ir::rematerializable;
 
 /// The registers the allocator hands out, by class and by whether calls preserve them.
 pub(crate) struct RegisterFile {

@@ -3156,7 +3156,7 @@ impl<'a> Builder<'a> {
             // read before an effect. A folded object is not (layer 4a, R-2): it is an ordinary
             // value with a home, whose facts (`build_names::folded_global_read`) the fold proved.
             NodeOp::FoldedGlobal { word }
-                if super::regalloc::rematerializable(&NodeOp::FoldedGlobal { word }) =>
+                if super::ir::rematerializable(&NodeOp::FoldedGlobal { word }) =>
             {
                 Some(word)
             }
