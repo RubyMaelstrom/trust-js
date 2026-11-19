@@ -7668,3 +7668,27 @@ target/p3/stage3/mega-review).
   only from a site that is megamorphic itself (V8 ic/ic.cc:1059-1066; JSC after 8 cases,
   InlineCacheCompiler.cpp:4680-4752; SpiderMonkey in Megamorphic mode,
   jit/CacheIR.cpp:1293-1298), and the commit is gated the same way before it is sent.
+
+The megamorphic line's piece 1a landed: the engine-wide property cache's entry holds its key
+(ab01e00e; 2026-11-19; target/p3/stage3/mega-impl/p1/report.txt, the agent's; the
+coordinator's check target/p3/stage3/m1a-review).
+- What it is. The cache (Interp::stub_cache, 4,096 direct-mapped entries keyed by receiver
+  shape and name) kept its entries in one vector and their keys in another behind a RefCell,
+  which machine code cannot read. Each entry now holds its key beside its resolution (40
+  bytes, one boxed array of 160 KiB an engine, made at the engine's start), the layout the
+  probe from generated code needs. No rule changes.
+- Measured, the coordinator's builds (fat LTO, target/p2/lto/ab01e00e against main's
+  abedce96; 5 fixed runs; graph | the tier off): Vue's fixture -0.23% | -0.20%, its steady
+  state -0.25% | -0.22%, GBEMU -0.28% | -0.18% (one load where there were two and a borrow
+  check), TypeScript -0.14% with the tier off (-1.3% at graph is its collector's draw);
+  nothing slower beyond its spread.
+- Checked: 63 adversarial programs at six modes and against main's engine; the mutation (the
+  probe compares no key) caught by interpreter::stub_cache_tests::two_keys_in_one_slot_never_
+  read_each_other, run by the coordinator.
+- Held, not landed: piece 1b, megamorphic named reads probing the cache from generated code
+  (d24dbd55). Alone it gains TypeScript -0.50% at graph and -1.73% with the tier off at 5
+  runs and costs GBEMU +0.57% | +0.45%, Djot's steady state +0.38% | +0.24%, Vue +0.11% |
+  +0.09%: a gate on a path GBEMU's typed-array reads take, and a whole probe before the Rust
+  probe for entries the template cannot serve (inferred by its agent). The next agent brings
+  it to its exit or says why it cannot get there alone, then builds the store table, where
+  the count's gain is.
