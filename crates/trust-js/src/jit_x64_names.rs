@@ -29,6 +29,10 @@ thread_local! {
 mod tests;
 
 #[cfg(all(test, target_arch = "x86_64"))]
+#[path = "jit_reference_location_tests.rs"]
+mod reference_location_tests;
+
+#[cfg(all(test, target_arch = "x86_64"))]
 #[path = "jit_packed_name_tests.rs"]
 mod packed_tests;
 
@@ -539,10 +543,15 @@ fn capture(
     a.nr_store(R10, offset_of!(PreparedReference, binding), CX);
     a.jmp(hints_done);
     a.bind(object_hint);
+    // The descriptor's three words: the shape, the slot and its location word, which
+    // `reference_target` addresses the slot by (the site is shared by every ResolveNameRef of
+    // the name in the chunk, each with its own Reference, as on ARM64).
     a.nr_load32(AX, R8, offset_of!(NativeNameDescriptor, shape));
     a.nr_store32(R10, offset_of!(PreparedReference, shape), AX);
     a.nr_load(AX, R8, offset_of!(NativeNameDescriptor, slot));
     a.nr_store(R10, offset_of!(PreparedReference, slot), AX);
+    a.nr_load32(AX, R8, offset_of!(NativeNameDescriptor, loc));
+    a.nr_store32(R10, offset_of!(PreparedReference, loc), AX);
     a.bind(hints_done);
 }
 

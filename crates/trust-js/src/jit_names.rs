@@ -46,6 +46,10 @@ pub(super) fn record_name_commit(a: &mut asm::Asm, kind: usize) {
 mod tests;
 
 #[cfg(test)]
+#[path = "jit_reference_location_tests.rs"]
+mod reference_location_tests;
+
+#[cfg(test)]
 #[path = "jit_packed_name_tests.rs"]
 mod packed_tests;
 
@@ -367,10 +371,17 @@ pub(super) fn emit_reference_op<C: JitChunk + ?Sized>(
             a.ldr_imm(15, 19, offset_of!(JitCtx, global_body) as u32);
             a.cmp_reg_x(13, 15);
             a.b_cond(C_NE, slow);
+            // The hint is the descriptor's three words: the shape, the slot and the slot's
+            // location word, which LoadRef and StoreRef address the slot by. The resolution site
+            // is the chunk's for the name, shared by every ResolveNameRef of it, each with its
+            // own Reference: another one's helper may have refilled the descriptor for a slot
+            // this Reference's location word does not name.
             a.ldr_w_imm(13, 12, offset_of!(NativeNameDescriptor, shape) as u32);
             a.str_w_imm(13, 8, offset_of!(R, shape) as u32);
             a.ldr_imm(13, 12, offset_of!(NativeNameDescriptor, slot) as u32);
             a.str_imm(13, 8, offset_of!(R, slot) as u32);
+            a.ldr_w_imm(13, 12, offset_of!(NativeNameDescriptor, loc) as u32);
+            a.str_w_imm(13, 8, offset_of!(R, loc) as u32);
             a.bind(strict);
             a.ldr_imm(13, 19, offset_of!(JitCtx, interp) as u32);
             let (strict_base, strict_offset) = byte_field_address(a, 13, ilayout.strict, 16);
