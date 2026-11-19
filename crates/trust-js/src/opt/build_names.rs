@@ -88,6 +88,9 @@ pub(super) struct Facts {
     checked: FastSet<(NodeIx, u64)>,
     /// A heap fact: the global property epoch checked in this effect epoch.
     epoch: bool,
+    /// A heap fact: the code's validity word tested in this effect epoch (F4 part 2, layer 2:
+    /// `CheckCodeValid`), which a folded read needs (`verify::folded_reads`).
+    valid: bool,
     /// Heap facts: the global environment's generation checked, by its record's node...
     generations: FastSet<(NodeIx, u32)>,
     /// ...and the global lexicals loaded, by their bindings' addresses.
@@ -99,6 +102,7 @@ impl Facts {
     pub(super) fn clear_heap(&mut self) {
         self.values.clear();
         self.epoch = false;
+        self.valid = false;
         self.generations.clear();
         self.lexicals.clear();
     }
@@ -167,6 +171,7 @@ impl Facts {
                 .copied()
                 .collect(),
             epoch: first.epoch && others().all(|names| names.epoch),
+            valid: first.valid && others().all(|names| names.valid),
             generations: first
                 .generations
                 .iter()
@@ -196,6 +201,7 @@ impl Facts {
         Facts {
             values: FastMap::default(),
             epoch: false,
+            valid: false,
             generations: FastSet::default(),
             lexicals: FastMap::default(),
             ..self.clone()
@@ -721,6 +727,7 @@ impl Builder<'_> {
             slot,
             location,
             epoch,
+            folded: fold,
             ..
         } = view
         else {
@@ -746,6 +753,9 @@ impl Builder<'_> {
             proof,
         };
         self.check_identity(st, cx, check, object);
+        if let Some(fold) = fold {
+            return self.folded_global_read(st, cx, fold);
+        }
         if !st.names.epoch {
             let state = self.before(cx, st);
             self.add_exit(
@@ -769,6 +779,37 @@ impl Builder<'_> {
         );
         st.fields.insert((object, location), value);
         value
+    }
+
+    /// A global-object read whose value the compile folded (F4 part 2, layer 2), after its
+    /// identity checks: the code's validity word tested once per effect epoch (`CheckCodeValid`,
+    /// exiting Invalidated at the read's pc with the state before it), then the value
+    /// (`FoldedGlobal`): no load, and no epoch check, which the property's dependency covers.
+    fn folded_global_read(
+        &mut self,
+        st: &mut State,
+        cx: &mut Before,
+        fold: crate::opt::snapshot::Folded,
+    ) -> NodeIx {
+        let pc = cx.pc;
+        if !st.names.valid {
+            let state = self.before(cx, st);
+            self.add_exit(
+                NodeOp::CheckCodeValid,
+                &[],
+                Rep::None,
+                pc,
+                state,
+                ExitReason::Invalidated,
+            );
+            st.names.valid = true;
+        }
+        self.add(
+            NodeOp::FoldedGlobal { word: fold.word },
+            &[],
+            Rep::Tagged,
+            pc,
+        )
     }
 
     /// A script-level lexical's read (see the module's doc), the site's view `view`.

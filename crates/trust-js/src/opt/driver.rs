@@ -929,12 +929,22 @@ fn prepare(
     // The oracle (TRUST_JS_OPT_INLINE=graph; P3 stage 3, step 2): the inline decisions and each
     // inlined callee's snapshot, its guards' data appended to the view's inline targets.
     let oracle_timer = main_thread_timer();
-    let (inlining, held) = match inline
+    let (mut inlining, mut held) = match inline
         .and_then(|request| super::oracle::prepare(i, chunk, &mut view, request, job_memory))
     {
         Some((inlining, held)) => (Some(inlining), held),
         None => (None, super::oracle::Held::default()),
     };
+    // The global properties the compile folds, the inlined callees' reads included (F4 part 2).
+    held.folds = super::global_fold::prepare(
+        i,
+        chunk,
+        std::iter::once(&mut snapshot).chain(
+            inlining
+                .iter_mut()
+                .flat_map(|inlining| inlining.callees.iter_mut().map(|(_, raw)| raw)),
+        ),
+    );
     if let (Some(inlining), Some(started)) = (&inlining, oracle_timer) {
         let ms = part_ms(started);
         // The ways nested in inlined frames and their deepest level (P3 stage 3 step 3d).
@@ -978,12 +988,14 @@ fn prepare(
     // A graph-inlined call's guard compares the realm's global environment as well (step 2).
     let pin = (off_thread || snapshot.reads_global_names_of(genv) || inlining.is_some())
         .then(|| crate::interpreter::Env::downgrade(&i.global_env));
+    let mut switches = a64::Switches::read(chunk);
+    switches.valid_word = held.folds.valid_word();
     let job = Job {
         view,
         snapshot,
         inlining,
         options: a64::Options::from_env(),
-        switches: a64::Switches::read(chunk),
+        switches,
         layout,
         ilayout: i.interp_layout.get(),
         verifies: verifies(),
@@ -1070,7 +1082,7 @@ fn finish(
     chunk: &Chunk,
     finished: Finished,
     pin: Option<crate::interpreter::WeakEnv>,
-    held: super::oracle::Held,
+    mut held: super::oracle::Held,
     timing: &Timing,
 ) -> Option<Rc<JitCode>> {
     let Finished {
@@ -1158,10 +1170,13 @@ fn finish(
         }
     };
     let Compiled {
-        assembled,
+        mut assembled,
         executable,
         nodes,
     } = *compiled;
+    // The code's validity word, held by its exit table for its life (F4 part 2).
+    let folds = std::mem::take(&mut held.folds);
+    assembled.table.valid = folds.valid().cloned();
     let executable = match executable {
         Some(executable) => {
             // Mapped by another thread: this core runs none of the code's stale instructions
@@ -1184,6 +1199,9 @@ fn finish(
         chunk,
         held.into_inlined(&frame_chunks),
     );
+    // On each folded property's list before the code can run (the install's other half; a job
+    // compiled off the main thread was checked by `dropped`).
+    folds.register();
     if embeds_genv {
         if let Some(pin) = pin {
             pin_global_environment(i, pin);
@@ -1848,6 +1866,9 @@ fn dropped(i: &Interp, job: &PendingJob) -> Option<&'static str> {
     if revisions(&job.chunk) + job.held.revisions() != job.revisions {
         return Some("a discard flagged its sites since its snapshot");
     }
+    if job.held.folds.changed() {
+        return Some("a folded global changed since its snapshot");
+    }
     match &job.landing {
         Landing::Publish(publication) => {
             let Some(func) = publication.func.upgrade() else {
@@ -1943,6 +1964,9 @@ pub(crate) enum Limit {
     /// The loop limit at an exit through an inlined frame whose callee's first stage tried to
     /// enter a loop (P3 stage 3, step 2; JSC's, dfg/DFGOSRExitCompilerCommon.cpp:70-104).
     InlinedLoop,
+    /// The code's first Invalidated exit (F4 part 2, layer 2): a global property whose value it
+    /// folded changed.
+    Invalidated,
 }
 
 /// An exit of the tier's code for `chunk` at or past its loop limit, the code not discarded
@@ -2022,10 +2046,20 @@ pub(crate) fn discard(i: &mut Interp, chunk: &Chunk, table: &ExitTable, limit: L
     let first = profile::first_stage(chunk);
     let reoptimizing = enabled() && !no_reopt();
     let before = ChunkProfile::get(first).map_or(0, ChunkProfile::discards);
-    let r = if reoptimizing {
-        ChunkProfile::of(first).add_discard()
-    } else {
+    let r = if !reoptimizing {
         before
+    } else if let Limit::Invalidated = limit {
+        let (r, limited) = super::global_fold::invalidation_discard(first);
+        if limited && log_enabled() {
+            log_line!(
+                "[opt] {} folds no global after {} invalidations",
+                name(chunk),
+                super::global_fold::FOLD_LIMIT
+            );
+        }
+        r
+    } else {
+        ChunkProfile::of(first).add_discard()
     };
     let taken: Vec<&ExitRecord> = table
         .exits
@@ -2065,6 +2099,7 @@ pub(crate) fn discard(i: &mut Interp, chunk: &Chunk, table: &ExitTable, limit: L
                 table.taken.get(),
                 table.loop_limit
             ),
+            Limit::Invalidated => "; invalidated: a folded global changed".to_string(),
         };
         log_line!(
             "[opt] discarded {} after {} exits (limit {}, R {before} -> {r}) for {}: {}{cause}",
@@ -2077,8 +2112,13 @@ pub(crate) fn discard(i: &mut Interp, chunk: &Chunk, table: &ExitTable, limit: L
     }
     if reoptimizing && !no_exit_profile() {
         for (index, exit) in table.exits.iter().enumerate() {
+            // An Invalidated exit flags no site (F4 part 2, layer 2): the property's state is
+            // the teacher.
             if exit.count.get() == 0
-                || matches!(exit.reason, ExitReason::Throw | ExitReason::Unsupported)
+                || matches!(
+                    exit.reason,
+                    ExitReason::Throw | ExitReason::Unsupported | ExitReason::Invalidated
+                )
             {
                 continue;
             }

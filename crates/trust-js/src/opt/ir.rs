@@ -310,6 +310,12 @@ pub(crate) enum ExitReason {
     /// Its own exit, not the moved check's: the flag keeps the loop's entry checks moved. Not
     /// kind-bound: a buffer's state, as Detached is.
     ObservedBuffer,
+    /// The code's validity word was set (F4 part 2, layer 2: `CheckCodeValid`): a global
+    /// property whose value it folded changed, was removed or shadowed since its install, as
+    /// SpiderMonkey's and V8's invalidated code and JSC's jettisoned code block. Flags no site:
+    /// the property's state, NotConstant from then on, is what every later snapshot reads; the
+    /// code is discarded at its first such exit (`exit::count`). Not kind-bound, never Generic.
+    Invalidated,
     /// No exit: the second-level flag (P3 stage 3 step L5). A discard adds it at a site one of
     /// whose exits had a reason its code's own snapshot already held flagged there with the same
     /// data (`ExitRecord::held`): the form that flag left at the site (the one it built, or the
@@ -336,6 +342,7 @@ pub(crate) const GENERIC_INELIGIBLE: u32 = 1 << ExitReason::Throw as u32
     | 1 << ExitReason::PhiNotInt32 as u32
     | 1 << ExitReason::ObservedBuffer as u32
     | 1 << ExitReason::WrongCallee as u32
+    | 1 << ExitReason::Invalidated as u32
     | 1 << ExitReason::Generic as u32;
 
 // The discard's and the back end's (driver.rs, a64.rs): where the tier has none (x86-64 until the
@@ -815,6 +822,17 @@ pub(crate) enum NodeOp {
         epoch: u16,
         proof: u8,
     },
+    /// The code's validity word is clear [Invalidated] (F4 part 2, layer 2): no global property
+    /// whose value the code folds changed since its install (`object_fuse::Locked::fire` sets
+    /// it). Made before the first folded read of each effect epoch (`verify::folded_reads`);
+    /// the word's address is the code's own (`a64::Switches::valid_word`), never a shared stub's.
+    CheckCodeValid,
+    /// -> Tagged: a global property's value folded at the compile (F4 part 2, layer 2), `word`
+    /// its bits, valid while the code's validity word is clear: pure, with no input, and
+    /// dominated within its effect epoch by a `CheckCodeValid` (`verify::folded_reads`).
+    FoldedGlobal {
+        word: u64,
+    },
     /// (Env): the global environment's record has the compile's generation [WrongName]: no
     /// binding was added, removed or moved since, so the cache's binding address is a global
     /// lexical's still (the plan's Q4: the record does not only append).
@@ -909,6 +927,7 @@ impl NodeOp {
                 | NodeOp::CheckEnvIs { .. }
                 | NodeOp::CheckCellIs { .. }
                 | NodeOp::CheckGlobalEpoch { .. }
+                | NodeOp::CheckCodeValid
                 | NodeOp::CheckEnvGeneration { .. }
                 | NodeOp::I32Add
                 | NodeOp::I32Sub

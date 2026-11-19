@@ -211,6 +211,12 @@ pub(crate) struct ExitTable {
     /// with the checks it stands for, which its discard flags (`driver::flag_moved`). Data only:
     /// nothing in the code reads it.
     pub(crate) moved: Box<[(u32, Box<[MovedSite]>)]>,
+    /// The code's validity word (F4 part 2, layer 2), where it folds a global property's value:
+    /// 0 while valid, set to 1 by the property's fuse (`object_fuse::Locked::fire`), which holds
+    /// a clone on the property's list from the install on. The code embeds its address and tests
+    /// it (`CheckCodeValid`); the table holds it for the code's life, so the address stays the
+    /// word's however long the fuse's list keeps its entry.
+    pub(crate) valid: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>,
 }
 
 /// The save area the exit stub makes (ARM64): x0..x29 at words 0..29, d0..d31 at words 30..61;
@@ -683,6 +689,17 @@ fn count(
     reason: ExitReason,
     from_loop: bool,
 ) {
+    if reason == ExitReason::Invalidated && !table.discarded.get() {
+        // A folded global changed (F4 part 2, layer 2): the code is discarded at its first such
+        // exit, as JSC jettisons a code block at its watchpoint's firing
+        // (bytecode/CodeBlockJettisoningWatchpoint.cpp:46) and SpiderMonkey invalidates an
+        // IonScript at its dependency's: new entries stop using it; this activation finishes in
+        // the VM, any other leaves at its next test.
+        exit.count.set(exit.count.get().saturating_add(1));
+        table.taken.set(table.taken.get().saturating_add(1));
+        super::discard(i, chunk, table, super::Limit::Invalidated);
+        return;
+    }
     if reason != ExitReason::Forced {
         // Repeated exits: at the limit, the code is discarded once (`opt::discard`) and new
         // entries stop using it; this activation finishes in the VM, any other running it in it.

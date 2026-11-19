@@ -116,6 +116,24 @@ impl Gen<'_> {
                     self.gp_done(n, dst);
                 }
             }
+            NodeOp::CheckCodeValid => {
+                // The code's validity word (F4 part 2, layer 2), its address a literal of this
+                // code's (`emit_valid_literal`): never a shared stub's.
+                let site = self.check_exit(n)?;
+                if self.switches.valid_word == 0 {
+                    return Err(Refusal::whole("a validity test without a validity word"));
+                }
+                self.a.ldr_literal_label(X17, self.l_valid);
+                self.a.ldr_w_imm(X17, X17, 0);
+                self.a.cbnz(X17, false, site);
+            }
+            NodeOp::FoldedGlobal { word } => {
+                if !unused {
+                    let dst = self.gp_dst(n);
+                    self.a.mov_imm64(dst, word);
+                    self.gp_done(n, dst);
+                }
+            }
             NodeOp::CheckGlobalEpoch { epoch, .. } => {
                 // The epoch through the global object, which the realm's checks proved.
                 let site = self.check_exit(n)?;
@@ -134,6 +152,26 @@ impl Gen<'_> {
             }
             _ => unreachable!("a free-name node"),
         }
+        Ok(())
+    }
+
+    /// The validity word's address as the literal the code's `CheckCodeValid` tests load (F4
+    /// part 2, layer 2), after every instruction, where execution never reaches: only where one
+    /// reads it. A literal load reaches 1 MiB, which relaxation at most doubling the code keeps
+    /// for a code under 512 KiB before it; a larger code that folds is refused.
+    pub(super) fn emit_valid_literal(&mut self) -> Result<(), Refusal> {
+        if !self.a.literal_referenced(self.l_valid) {
+            return Ok(());
+        }
+        if self.a.len_insns() >= 1 << 17 {
+            return Err(Refusal::whole(
+                "a code that folds a global past a literal's reach",
+            ));
+        }
+        let address = self.switches.valid_word as u64;
+        self.a.bind(self.l_valid);
+        self.a.word(address as u32);
+        self.a.word((address >> 32) as u32);
         Ok(())
     }
 }

@@ -103,11 +103,9 @@ pub(crate) struct ObjectFuse {
     invalidated: AtomicU32,
     /// Bumped by the removal of a tracked property; [`GENERATION_INVALID`] once saturated.
     generation: AtomicU32,
-    /// The lock of transitions, and every state buffer the fuse published, the current one last
-    /// (see the type's documentation). A buffer's word 0 counts the state words after it, each
-    /// holding sixteen properties' two bits; it grows by doubling, so the retired buffers hold
-    /// fewer words than the current one.
-    buffers: Mutex<Vec<Box<[AtomicU32]>>>,
+    /// The lock of transitions, and what it guards ([`Locked`]): every state buffer the fuse
+    /// published and the dependent codes of its Constant properties.
+    locked: Mutex<Locked>,
     /// The current buffer's address ([`NO_STATES`] until a property is tracked), which generated
     /// code reads a site's word through (`jit::string_calls`, the word index its
     /// [`GuardData::index`] names). A buffer never shrinks: a site's word, in range when it
@@ -115,6 +113,69 @@ pub(crate) struct ObjectFuse {
     words: AtomicPtr<AtomicU32>,
     /// The fused object's map, the registry's key.
     props: usize,
+}
+
+/// What an [`ObjectFuse`]'s lock guards.
+#[derive(Default)]
+struct Locked {
+    /// Every state buffer the fuse published, the current one last (see the type's
+    /// documentation). A buffer's word 0 counts the state words after it, each holding sixteen
+    /// properties' two bits; it grows by doubling, so the retired buffers hold fewer words than
+    /// the current one.
+    buffers: Vec<Box<[AtomicU32]>>,
+    /// By slot, the validity words of the installed codes that folded the Constant property's
+    /// value (F4 part 2, layer 2; SpiderMonkey's DepMap of DependentIonScriptSet,
+    /// vm/ObjectFuse.h:121-125, V8's DependentCode list): the property's change, removal or
+    /// shadowing sets each to 1 and clears the list ([`Locked::fire`]). A code holds its word
+    /// for its life (its exit table's `valid`); an entry whose count is 1, its code freed, is
+    /// pruned at the list's next insertion, so nothing dangles and nothing unregisters.
+    dependents: crate::fasthash::FastMap<usize, Vec<Arc<AtomicU32>>>,
+}
+
+impl Locked {
+    /// Invalidate every code on the list of the property at `slot` and clear the list: each
+    /// live word set to 1, which the code tests before its folded reads (`CheckCodeValid`).
+    /// Relaxed: the codes run on this fuse's Agent's thread, which writes the word.
+    fn fire(&mut self, slot: usize) {
+        if let Some(list) = self.dependents.remove(&slot) {
+            fired(&list);
+        }
+    }
+
+    /// [`Locked::fire`] for every property.
+    fn fire_all(&mut self) {
+        for (_, list) in self.dependents.drain() {
+            fired(&list);
+        }
+    }
+}
+
+/// Set each live word of a fired list (see [`Locked::fire`]); the census counts the codes it
+/// invalidated, not those already invalid (a discarded code stays on its other properties'
+/// lists until it is freed).
+fn fired(list: &[Arc<AtomicU32>]) {
+    let mut codes = 0;
+    for word in list {
+        if Arc::strong_count(word) > 1 && word.swap(1, Ordering::Relaxed) == 0 {
+            codes += 1;
+        }
+    }
+    if codes > 0 {
+        GLOBAL_INVALIDATIONS.fetch_add(1, Ordering::Relaxed);
+        GLOBAL_INVALIDATED_CODES.fetch_add(codes, Ordering::Relaxed);
+        #[cfg(test)]
+        TEST_FIRED.with(|fired| fired.set((fired.get().0 + 1, fired.get().1 + codes)));
+    }
+}
+
+/// Lists fired that held a live code, and the codes they invalidated (the census, F4 part 2).
+static GLOBAL_INVALIDATIONS: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_INVALIDATED_CODES: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+thread_local! {
+    /// This thread's fired lists that held a live code, and the codes invalidated (tests).
+    pub(crate) static TEST_FIRED: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
 }
 
 /// The state buffer of a fuse that tracks no property yet: a count of 0 words, never written.
@@ -135,7 +196,7 @@ impl ObjectFuse {
         let fuse = Arc::new(Self {
             invalidated: AtomicU32::new(0),
             generation: AtomicU32::new(0),
-            buffers: Mutex::new(Vec::new()),
+            locked: Mutex::new(Locked::default()),
             words: AtomicPtr::new(std::ptr::from_ref(&NO_STATES).cast_mut()),
             props,
         });
@@ -144,8 +205,8 @@ impl ObjectFuse {
     }
 
     /// The lock of transitions (see the type's documentation).
-    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Box<[AtomicU32]>>> {
-        self.buffers.lock().unwrap_or_else(|e| e.into_inner())
+    fn lock(&self) -> std::sync::MutexGuard<'_, Locked> {
+        self.locked.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// The state of the property at `slot`, read without the lock: the published buffer's
@@ -214,7 +275,7 @@ impl ObjectFuse {
     /// How many state buffers the fuse has published, every one kept (tests).
     #[cfg(test)]
     pub(crate) fn published_buffers(&self) -> usize {
-        self.lock().len()
+        self.lock().buffers.len()
     }
 
     /// The number of slots the current buffer holds states for.
@@ -242,8 +303,9 @@ impl ObjectFuse {
     /// reaches the property, so a tracked property's guards fail. The state is kept.
     pub(crate) fn handle_shadowed(&self, slot: usize) {
         if self.state(slot) != PropertyState::Untracked {
-            let _transition = self.lock();
+            let mut locked = self.lock();
             self.bump_generation();
+            locked.fire(slot);
         }
     }
 
@@ -252,13 +314,14 @@ impl ObjectFuse {
     /// (SpiderMonkey's invalidateAllDependentIonScripts with a generation bump, as its
     /// handleGlobalLexicalMutation, vm/ObjectFuse.cpp:177-180).
     pub(crate) fn handle_all_changed(&self) {
-        let mut buffers = self.lock();
+        let mut locked = self.lock();
         for slot in 0..self.tracked_len() {
             if self.state(slot) == PropertyState::Constant {
-                self.set_state(&mut buffers, slot, PropertyState::NotConstant);
+                self.set_state(&mut locked.buffers, slot, PropertyState::NotConstant);
             }
         }
         self.bump_generation();
+        locked.fire_all();
     }
 
     /// Whether a guard's fast path holds: no Constant property was invalidated and the generation
@@ -291,9 +354,11 @@ impl ObjectFuse {
         if generation == GENERATION_INVALID {
             return None;
         }
-        let mut buffers = self.lock();
+        let mut locked = self.lock();
         match self.state(slot) {
-            PropertyState::Untracked => self.set_state(&mut buffers, slot, PropertyState::Constant),
+            PropertyState::Untracked => {
+                self.set_state(&mut locked.buffers, slot, PropertyState::Constant)
+            }
             PropertyState::Constant => {}
             PropertyState::NotConstant => return None,
         }
@@ -322,19 +387,57 @@ impl ObjectFuse {
         unsafe { (*words.add(data.index as usize)).load(Ordering::Relaxed) & data.mask == 0 }
     }
 
+    /// Whether the property at `slot` is Constant under `generation`, the one a compile's fold
+    /// recorded ([`ObjectFuse::try_optimize_constant`]): the install's check (F4 part 2, layer 2;
+    /// V8 drops a job whose dependencies fail, maglev/maglev-compiler.cc:359-368).
+    pub(crate) fn still_constant(&self, slot: usize, generation: u32) -> bool {
+        self.generation() == generation && self.state(slot) == PropertyState::Constant
+    }
+
+    /// Put `word`, an installed code's validity word, on the list of the property at `slot`,
+    /// whose value the code folded under `generation` (SpiderMonkey's addDependency of an
+    /// IonScript to its DepMap, V8's DependentCode::InstallDependency): false, and nothing put,
+    /// where the property is no longer Constant under it, which the check and the insertion test
+    /// under the lock together. The list's entries whose code was freed go first.
+    pub(crate) fn add_dependent(
+        &self,
+        slot: usize,
+        generation: u32,
+        word: &Arc<AtomicU32>,
+    ) -> bool {
+        let mut locked = self.lock();
+        if !self.still_constant(slot, generation) {
+            return false;
+        }
+        let list = locked.dependents.entry(slot).or_default();
+        list.retain(|word| Arc::strong_count(word) > 1);
+        list.push(word.clone());
+        true
+    }
+
+    /// The entries on the list of the property at `slot`, a freed code's among them until the
+    /// list's next insertion prunes it (tests).
+    #[cfg(test)]
+    pub(crate) fn dependents(&self, slot: usize) -> usize {
+        self.lock().dependents.get(&slot).map_or(0, Vec::len)
+    }
+
     /// A write of the value at `slot`, or a define there that is not redundant (SpiderMonkey's
     /// handlePropertyValueChange). A NotConstant property, which no write moves, takes no lock.
     pub(crate) fn handle_value_change(&self, slot: usize) -> PropertyState {
         if self.state(slot) == PropertyState::NotConstant {
             return PropertyState::NotConstant;
         }
-        let mut buffers = self.lock();
+        let mut locked = self.lock();
         let state = self.state(slot);
         match state {
-            PropertyState::Untracked => self.set_state(&mut buffers, slot, PropertyState::Constant),
+            PropertyState::Untracked => {
+                self.set_state(&mut locked.buffers, slot, PropertyState::Constant)
+            }
             PropertyState::Constant => {
                 self.invalidated.store(1, Ordering::Relaxed);
-                self.set_state(&mut buffers, slot, PropertyState::NotConstant);
+                self.set_state(&mut locked.buffers, slot, PropertyState::NotConstant);
+                locked.fire(slot);
             }
             PropertyState::NotConstant => {}
         }
@@ -346,31 +449,41 @@ impl ObjectFuse {
     /// tracked property, or one before a tracked property, whose slot changes, bumps the
     /// generation.
     pub(crate) fn handle_remove(&self, slot: usize) {
-        let mut buffers = self.lock();
+        let mut locked = self.lock();
         let len = self.tracked_len();
         if (slot..len).any(|at| self.state(at) != PropertyState::Untracked) {
             self.bump_generation();
         }
         for at in slot..len.saturating_sub(1) {
             let next = self.state(at + 1);
-            self.set_state(&mut buffers, at, next);
+            self.set_state(&mut locked.buffers, at, next);
         }
         if len != 0 {
-            self.set_state(&mut buffers, len - 1, PropertyState::Untracked);
+            self.set_state(&mut locked.buffers, len - 1, PropertyState::Untracked);
+        }
+        // The removed property's codes are invalidated; the later properties' lists move down
+        // with their states (their values, which the codes folded, stay).
+        locked.fire(slot);
+        if locked.dependents.keys().any(|&at| at > slot) {
+            locked.dependents = std::mem::take(&mut locked.dependents)
+                .into_iter()
+                .map(|(at, list)| (if at > slot { at - 1 } else { at }, list))
+                .collect();
         }
     }
 
     /// Every property is removed (`Props::clear`, which only tests call).
     #[cfg(test)]
     pub(crate) fn handle_clear(&self) {
-        let mut buffers = self.lock();
+        let mut locked = self.lock();
         let len = self.tracked_len();
         if (0..len).any(|at| self.state(at) != PropertyState::Untracked) {
             self.bump_generation();
         }
         for at in 0..len {
-            self.set_state(&mut buffers, at, PropertyState::Untracked);
+            self.set_state(&mut locked.buffers, at, PropertyState::Untracked);
         }
+        locked.fire_all();
     }
 }
 
@@ -703,12 +816,14 @@ pub(crate) fn global_property_state(props: usize, slot: usize) -> PropertyState 
 pub(crate) fn global_census_dump() {
     if census() {
         eprintln!(
-            "[opt] global stores: checked {}, constants changed {}, same value {}, fills refused {}, reference hints refused {}",
+            "[opt] global stores: checked {}, constants changed {}, same value {}, fills refused {}, reference hints refused {}; invalidations {} of {} codes",
             GLOBAL_CHECKED_STORES.load(Ordering::Relaxed),
             GLOBAL_CHANGED_CONSTANTS.load(Ordering::Relaxed),
             GLOBAL_SAME_VALUE_CHANGES.load(Ordering::Relaxed),
             GLOBAL_REFUSED_FILLS.load(Ordering::Relaxed),
-            GLOBAL_REFUSED_HINTS.load(Ordering::Relaxed)
+            GLOBAL_REFUSED_HINTS.load(Ordering::Relaxed),
+            GLOBAL_INVALIDATIONS.load(Ordering::Relaxed),
+            GLOBAL_INVALIDATED_CODES.load(Ordering::Relaxed)
         );
     }
 }

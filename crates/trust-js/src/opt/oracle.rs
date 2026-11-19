@@ -50,6 +50,9 @@ pub(crate) enum Request {
 /// table and released with the code or with a job dropped before its install.
 #[derive(Default)]
 pub(crate) struct Held {
+    /// The global properties the compile folded and the code's validity word (F4 part 2, layer
+    /// 2), which the install checks and registers (`driver::dropped`, `driver::finish`).
+    pub(crate) folds: super::global_fold::Folds,
     pub(crate) chunks: Vec<Rc<Chunk>>,
     pub(crate) pins: Vec<crate::value::WeakGc>,
     pub(crate) sites: crate::stack_trace::InlineSites,

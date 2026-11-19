@@ -163,6 +163,9 @@ pub(crate) enum NameView {
         epoch: u16,
         /// The site's cache as the snapshot read it (F4 part 1, `NameFill`).
         fill: NameFill,
+        /// The property's value, folded under a dependency (F4 part 2, layer 2:
+        /// `global_fold::prepare`), or None: the read loads it.
+        folded: Option<Folded>,
     },
     /// A binding of the realm's global declarative record, a script-level `let`, `const` or
     /// `class` (the cache in scope mode on the realm's global environment), under the cache's
@@ -188,6 +191,15 @@ pub(crate) enum NameView {
     Empty,
     /// The refused-fill mark: the site ran, and no fill could cache it.
     Refused,
+}
+
+/// A global property's value a compile folds (F4 part 2, layer 2): its bits, and the fuse's
+/// generation the property was made Constant under (`ObjectFuse::try_optimize_constant`), which
+/// the install checks again (`driver::dropped`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Folded {
+    pub(crate) word: u64,
+    pub(crate) generation: u32,
 }
 
 /// A free-name site's cache words (F4 part 1): its environment word, whose tag bits are its mode
@@ -332,6 +344,22 @@ impl Raw {
             ops.len(),
             inlined,
         );
+    }
+
+    /// The global-object reads' views, which the fold rewrites (F4 part 2, layer 2:
+    /// `global_fold::prepare`, on the main thread after the snapshot).
+    #[cfg_attr(
+        not(all(
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) fn global_reads_mut(&mut self) -> impl Iterator<Item = &mut NameView> + '_ {
+        self.names
+            .iter_mut()
+            .map(|(_, view)| view)
+            .filter(|view| matches!(view, NameView::Global { .. }))
     }
 
     /// [`Raw::take_into`] of an inlined callee's first stage (P3 stage 3, step 2): its exit
@@ -981,6 +1009,7 @@ fn global_view(
         location,
         epoch,
         fill: NameFill::of(ic),
+        folded: None,
     })
 }
 

@@ -6365,8 +6365,14 @@ impl Interp {
         }
     }
 
-    /// The active realm's global object's fuse (F4 part 2; tests until the fold reads it).
-    #[cfg(test)]
+    /// The active realm's global object's fuse (F4 part 2: the tier's fold, `opt::global_fold`).
+    #[cfg_attr(
+        not(all(
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        )),
+        allow(dead_code)
+    )]
     pub(crate) fn global_fuse(&self) -> Option<std::sync::Arc<crate::object_fuse::ObjectFuse>> {
         self.realm_fuses.as_ref()?.global.clone()
     }

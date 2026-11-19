@@ -65,6 +65,9 @@ pub(crate) struct ChunkProfile {
     /// key the most shapes a discarded check there expected (0 otherwise).
     sites: RefCell<Vec<(u32, u8)>>,
     discards: Cell<u8>,
+    /// The discards of the function's code at an Invalidated exit (F4 part 2, R-3), saturating:
+    /// at `fold::FOLD_LIMIT` its compiles fold no global ([`ChunkProfile::folds_globals`]).
+    invalidations: Cell<u8>,
     /// The warm-up's next checkpoint (from 1, saturating at 255), 0 while none is armed.
     warm_up: Cell<u8>,
     /// The native run count the warm-up's next checkpoint is due at.
@@ -281,6 +284,19 @@ impl ChunkProfile {
     /// R, the function's discards so far (on its first stage).
     pub(crate) fn discards(&self) -> u8 {
         self.discards.get()
+    }
+
+    /// Count a discard at an Invalidated exit (F4 part 2, R-3); the new count.
+    pub(crate) fn add_invalidation(&self) -> u8 {
+        let count = self.invalidations.get().saturating_add(1);
+        self.invalidations.set(count);
+        self.revise();
+        count
+    }
+
+    /// The discards at an Invalidated exit so far.
+    pub(crate) fn invalidations(&self) -> u8 {
+        self.invalidations.get()
     }
 
     /// Count a discard; the new R.

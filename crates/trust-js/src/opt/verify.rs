@@ -258,6 +258,7 @@ pub(crate) fn verify_frames(
     }
     proven_objects(graph, &dom)?;
     kept_heap(graph, &dom)?;
+    folded_reads(graph)?;
     // The builder's liveness again, where its cost is a test's or a debug build's: each frame's
     // chunk's.
     let liveness: Vec<Option<SlotLiveness>> = chunks
@@ -526,6 +527,79 @@ fn kept_heap(graph: &Graph, dom: &Dominators) -> Result<(), String> {
     Ok(())
 }
 
+/// Every folded global read is dominated within its effect epoch by a test of the code's
+/// validity word (F4 part 2, layer 2): a forward pass whose bit a `CheckCodeValid` sets and an
+/// effect or a generic node clears ([`heap_write`]'s `Any`: only these may run JavaScript, so
+/// only these may change, remove or shadow a global property; a lowered store reaches only a
+/// NotConstant property, which no compile folds), met by AND at a join, the entry's and an
+/// unreached block's clear; each `FoldedGlobal` needs it set. A loop that keeps the bit through
+/// its body needs no case of its own: its back edge brings the bit its entry had.
+fn folded_reads(graph: &Graph) -> Result<(), String> {
+    if !graph
+        .nodes
+        .iter()
+        .any(|node| matches!(node.op, NodeOp::FoldedGlobal { .. }))
+    {
+        return Ok(());
+    }
+    let entry = graph.entry.ok_or("the graph has no entry block")?;
+    // The bit at each block's end, from "set" down (a must-analysis's top), until stable.
+    let mut out = vec![true; graph.blocks.len()];
+    let walk = |block: BlockIx, mut bit: bool, check: bool| -> Result<bool, String> {
+        let data = graph.block(block);
+        for &node in data.phis.iter().chain(&data.body) {
+            let op = &graph.node(node).op;
+            match op {
+                NodeOp::CheckCodeValid => bit = true,
+                NodeOp::FoldedGlobal { .. } if check && !bit => {
+                    return Err(format!(
+                        "node {} (a folded global read at pc {}, block {}) without a validity                          test in its effect epoch",
+                        node.index(),
+                        graph.node(node).pc,
+                        block.index()
+                    ));
+                }
+                _ if matches!(heap_write(op), HeapWrite::Any) => bit = false,
+                _ => {}
+            }
+        }
+        Ok(bit)
+    };
+    let in_bit = |block: BlockIx, out: &[bool]| -> bool {
+        let preds = &graph.block(block).preds;
+        block != entry && !preds.is_empty() && preds.iter().all(|pred| out[pred.index()])
+    };
+    loop {
+        let mut changed = false;
+        for index in 0..graph.blocks.len() {
+            let block = BlockIx(index as u32);
+            let bit = walk(block, in_bit(block, &out), false)?;
+            if bit != out[index] {
+                out[index] = bit;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    for index in 0..graph.blocks.len() {
+        let block = BlockIx(index as u32);
+        walk(block, in_bit(block, &out), true)?;
+    }
+    Ok(())
+}
+
+/// Tests: the folded reads' rule alone ([`folded_reads`]) on `graph`.
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) fn verify_folded_reads(graph: &Graph) -> Result<(), String> {
+    folded_reads(graph)
+}
+
 /// Tests: the union rule alone ([`kept_heap`]) on `graph`, whatever else it breaks.
 #[cfg(all(
     test,
@@ -677,6 +751,8 @@ fn heap_write(op: &NodeOp) -> HeapWrite {
         | NodeOp::CheckGlobalEpoch { .. }
         | NodeOp::CheckEnvGeneration { .. }
         | NodeOp::LoadGlobalLexical { .. }
+        | NodeOp::CheckCodeValid
+        | NodeOp::FoldedGlobal { .. }
         | NodeOp::Jump { .. }
         | NodeOp::Branch { .. }
         | NodeOp::Return => HeapWrite::Nothing,
@@ -887,7 +963,9 @@ fn speculative(graph: &Graph, node: &Node, dom: &Dominators) -> bool {
         Some(ExitReason::PhiNotNumber | ExitReason::PhiNotInt32 | ExitReason::HoistingFailed) => {
             true
         }
-        Some(ExitReason::WrongName) => {
+        // A loop's global read at its entry (F4 part 1), its validity test among its checks
+        // where it folds (part 2).
+        Some(ExitReason::WrongName | ExitReason::Invalidated) => {
             let [next] = graph.block(node.block).succs[..] else {
                 return false;
             };
@@ -933,6 +1011,7 @@ fn speculation(
                 | NodeOp::CheckGlobalEpoch { .. }
                 | NodeOp::CheckEnvGeneration { .. }
         ),
+        Some(ExitReason::Invalidated) => node.op == NodeOp::CheckCodeValid,
         _ => matches!(
             node.op,
             NodeOp::CheckNumber
@@ -960,7 +1039,7 @@ fn speculation(
         // entry.
         if !matches!(
             node.reason,
-            Some(ExitReason::HoistingFailed | ExitReason::WrongName)
+            Some(ExitReason::HoistingFailed | ExitReason::WrongName | ExitReason::Invalidated)
         ) || target.preds[..] != [node.block]
         {
             return Err("a phi's speculation off a loop's entry edge".into());
@@ -1110,6 +1189,8 @@ fn signature(op: &NodeOp) -> Option<(&'static [Rep], Rep)> {
         NodeOp::CheckCellIs { .. } | NodeOp::CheckGlobalEpoch { .. } => (CELL, Rep::None),
         NodeOp::CheckEnvGeneration { .. } => (&[Rep::Env], Rep::None),
         NodeOp::LoadGlobalLexical { .. } => (&[Rep::Env], Rep::Tagged),
+        NodeOp::CheckCodeValid => (&[], Rep::None),
+        NodeOp::FoldedGlobal { .. } => (&[], Rep::Tagged),
         NodeOp::Poll | NodeOp::Jump(_) | NodeOp::Exit(_) => (&[], Rep::None),
         NodeOp::Branch { .. } => (BOOL, Rep::None),
         NodeOp::Return => (TAGGED, Rep::None),

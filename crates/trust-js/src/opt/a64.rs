@@ -218,6 +218,10 @@ pub(crate) struct Switches {
     pub(crate) stub_memory_refused: bool,
     #[cfg(test)]
     pub(crate) stubs_write_d8: bool,
+    /// The address of the code's validity word (F4 part 2, layer 2: `global_fold::Folds`), 0
+    /// where the compile folds no global; `CheckCodeValid` tests it. The code's own, never a
+    /// shared stub's.
+    pub(crate) valid_word: usize,
 }
 
 impl Switches {
@@ -240,6 +244,7 @@ impl Switches {
             stub_memory_refused: crate::opt::stub_test_switches().0,
             #[cfg(test)]
             stubs_write_d8: crate::opt::stub_test_switches().1,
+            valid_word: 0,
         }
     }
 
@@ -1120,6 +1125,9 @@ struct Gen<'a> {
     l_direct_finish: usize,
     l_exit_stub: usize,
     l_trap: usize,
+    /// The code's validity word's address, a literal after the stubs (F4 part 2, layer 2:
+    /// `CheckCodeValid`), bound only where a test reads it.
+    l_valid: usize,
     l_dsave: usize,
     /// The epilogues' d8..d15 restore groups.
     drestore: (usize, usize),
@@ -1304,6 +1312,7 @@ impl<'a> Gen<'a> {
         let l_direct_finish = a.new_label();
         let l_exit_stub = a.new_label();
         let l_trap = a.new_label();
+        let l_valid = a.new_label();
         Gen {
             a,
             chunk,
@@ -1321,6 +1330,7 @@ impl<'a> Gen<'a> {
             l_direct_finish,
             l_exit_stub,
             l_trap,
+            l_valid,
             l_dsave: 0,
             drestore: (0, 0),
             exits: Vec::new(),
@@ -1426,6 +1436,7 @@ impl<'a> Gen<'a> {
         if self.direct_on && self.a.label_referenced(self.l_direct_finish) {
             emit_direct_finish_stub(&mut self.a, self.ilayout, self.layout.valid);
         }
+        self.emit_valid_literal()?;
         Ok(())
     }
 
@@ -1444,6 +1455,10 @@ impl<'a> Gen<'a> {
         exported.extend(self.exits.iter().map(|&(_, ret, _)| ret));
         let (l_drestore_ok, l_drestore_throw) = self.drestore;
         exported.extend([self.l_dsave, l_drestore_ok, l_drestore_throw]);
+        // The validity word's literal, data the FP scan skips (F4 part 2).
+        if self.a.literal_referenced(self.l_valid) {
+            exported.push(self.l_valid);
+        }
         let fp_callee_saved = self.a.writes_callee_saved_fp();
         if self.a.failed().is_some() {
             return Err(Refusal::whole("an operand no instruction encodes"));
@@ -1452,11 +1467,15 @@ impl<'a> Gen<'a> {
         let (mut words, offsets) = a.finish_with_offsets(&exported);
         let n_exits = self.exits.len();
         let trap = offsets[0];
-        let fp_saves: Vec<usize> = offsets[1 + n_exits..]
+        let fp_saves: Vec<usize> = offsets[1 + n_exits..1 + n_exits + 3]
             .iter()
             .map(|&offset| offset as usize / 4)
             .collect();
-        skip_unused_callee_saved_fp(&mut words, &fp_saves, fp_callee_saved);
+        let data: Vec<usize> = offsets[1 + n_exits + 3..]
+            .iter()
+            .map(|&offset| offset as usize / 4)
+            .collect();
+        skip_unused_callee_saved_fp(&mut words, &fp_saves, fp_callee_saved, &data);
         // Whether each record's reason was already flagged at its site with its data (P3 stage 3
         // step L5): its frame's snapshot's flags, which the builder kept by frame state. None
         // where the builder kept none (a compile whose snapshots flag nothing at any state's
@@ -1724,6 +1743,7 @@ fn default_reason(op: &NodeOp) -> ExitReason {
         | NodeOp::CheckCellIs { .. }
         | NodeOp::CheckGlobalEpoch { .. }
         | NodeOp::CheckEnvGeneration { .. } => ExitReason::WrongName,
+        NodeOp::CheckCodeValid => ExitReason::Invalidated,
         NodeOp::I32Add | NodeOp::I32Sub | NodeOp::I32Mul | NodeOp::I32UShr => ExitReason::Overflow,
         NodeOp::CheckElements(_) => ExitReason::WrongElements,
         NodeOp::CheckIndex => ExitReason::NotInt32,
@@ -2448,7 +2468,9 @@ impl Gen<'_> {
             | NodeOp::CheckCellIs { .. }
             | NodeOp::CheckGlobalEpoch { .. }
             | NodeOp::CheckEnvGeneration { .. }
-            | NodeOp::LoadGlobalLexical { .. } => self.lower_name(n)?,
+            | NodeOp::LoadGlobalLexical { .. }
+            | NodeOp::CheckCodeValid
+            | NodeOp::FoldedGlobal { .. } => self.lower_name(n)?,
             NodeOp::EntrySlot(slot) | NodeOp::FrameSlot(slot) => {
                 if !unused {
                     let dst = self.gp_dst(n);

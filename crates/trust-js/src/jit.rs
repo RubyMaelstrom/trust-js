@@ -3552,6 +3552,10 @@ mod asm {
         pub buf: Vec<u32>,
         /// (instruction index, label id, kind) — resolved in `finish`.
         patches: Vec<(usize, usize, PatchKind)>,
+        /// LDR (literal) loads of a data doubleword at a label (`ldr_literal_label`), as (the
+        /// load's position, the label): kept apart from the branches' patches, whose loops they
+        /// would slow (F4 part 2), relocated as relaxation inserts veneers and resolved with them.
+        lits: Vec<(usize, usize)>,
         labels: Vec<Option<usize>>, // label id → instruction index
         /// Out-of-line routines shared by every site of this compilation, as (stub key, entry
         /// label). The compiler emits each once after the body (see `super::SharedStub`).
@@ -3670,6 +3674,7 @@ mod asm {
             Asm {
                 buf: Vec::new(),
                 patches: Vec::new(),
+                lits: Vec::new(),
                 labels: Vec::new(),
                 stubs: Vec::new(),
                 hot: false,
@@ -3913,6 +3918,9 @@ mod asm {
         pub fn rewind(&mut self, checkpoint: (usize, usize, usize)) {
             self.buf.truncate(checkpoint.0);
             self.patches.truncate(checkpoint.1);
+            if !self.lits.is_empty() {
+                self.rewind_literals(checkpoint.0);
+            }
             self.labels.truncate(checkpoint.2);
             // A failure met by the discarded emission goes with it (`fail` emits a word, so an
             // earlier failure lies before the checkpoint's length).
@@ -3965,6 +3973,40 @@ mod asm {
         /// ldr xt, label: a 64-bit load of the doubleword `offset` bytes from this instruction
         /// (LDR (literal): a signed 19-bit word offset, +-1 MiB). The loaded words are data in
         /// the code, which no branch patching moves apart from this instruction.
+        /// ldr xt, label: a 64-bit load of the doubleword at `label` (bound before two `word`s
+        /// where execution never reaches), its offset resolved after branch relaxation (imm19,
+        /// +-1 MiB; the caller keeps the code within reach).
+        pub fn ldr_literal_label(&mut self, rt: u32, label: usize) {
+            self.lits.push((self.buf.len(), label));
+            self.emit(0x5800_0000 | rt);
+        }
+        /// [`Asm::rewind`]'s part for the literal loads (none in template code).
+        #[cold]
+        #[inline(never)]
+        fn rewind_literals(&mut self, length: usize) {
+            self.lits.retain(|&(at, _)| at < length);
+        }
+        /// Each literal load's offset to its words, after relaxation (none in template code).
+        #[cold]
+        #[inline(never)]
+        fn resolve_literals(&mut self) {
+            for (at, label) in std::mem::take(&mut self.lits) {
+                let delta = self.labels[label].expect("unbound literal label") as i64 - at as i64;
+                assert!(
+                    (-(1 << 18)..(1 << 18)).contains(&delta),
+                    "JIT literal load out of range: {delta} instructions"
+                );
+                self.buf[at] |= ((delta as u32) & 0x7FFFF) << 5;
+            }
+        }
+        /// Whether a literal load reads the words at `label`.
+        pub fn literal_referenced(&self, label: usize) -> bool {
+            self.lits.iter().any(|&(_, target)| target == label)
+        }
+        /// The code's length in instructions so far.
+        pub fn len_insns(&self) -> usize {
+            self.buf.len()
+        }
         pub fn ldr_literal_x(&mut self, rt: u32, offset: i32) {
             if offset % 4 != 0 || !(-(1 << 20)..(1 << 20)).contains(&offset) {
                 return self.bad("an LDR literal's offset off its word grid or past 1 MiB");
@@ -5038,6 +5080,9 @@ mod asm {
                     }
                 }
             }
+            if !self.lits.is_empty() {
+                self.resolve_literals();
+            }
             let offsets = exported
                 .iter()
                 .map(|&label| {
@@ -5145,6 +5190,17 @@ mod asm {
             for (label, cut) in self.labels.iter_mut().zip(cuts) {
                 if let (Some(at), Some(cut)) = (label, cut) {
                     *at += prefix[cut];
+                }
+            }
+            // A literal load after a widened branch moves by one instruction for each.
+            if !self.lits.is_empty() {
+                // (Rare: a tier code past TBZ's reach that folds a global.)
+                let widened: Vec<usize> = (0..count)
+                    .filter(|&k| wide[k])
+                    .map(|k| self.patches[k].0)
+                    .collect();
+                for (at, _) in &mut self.lits {
+                    *at += widened.partition_point(|&branch| branch < *at);
                 }
             }
             let mut code = Vec::with_capacity(self.buf.len() + prefix[count]);
@@ -5626,6 +5682,36 @@ mod asm {
             // SAFETY: the buffer holds a leaf function returning x0, which the literal loads.
             let f: extern "C" fn() -> u64 = unsafe { std::mem::transmute(buffer.as_ptr()) };
             assert_eq!(f(), value);
+        }
+
+        #[test]
+        fn a_labelled_literal_load_finds_its_words_after_relaxation() {
+            // F4 part 2's validity word: a literal load whose words lie past a conditional
+            // branch that relaxation widens (one instruction inserted between them).
+            let value: u64 = 0x0000_ffff_8765_4321;
+            let mut a = super::Asm::new();
+            let (literal, over, far) = (a.new_label(), a.new_label(), a.new_label());
+            a.ldr_literal_label(0, literal);
+            a.b_cond(super::super::C_EQ, far);
+            a.b(over);
+            a.bind(literal);
+            a.word(value as u32);
+            a.word((value >> 32) as u32);
+            a.bind(over);
+            for _ in 0..270_000 {
+                a.mov(0, 0);
+            }
+            a.bind(far);
+            a.ret();
+            let before = a.len_insns();
+            let code = a.finish();
+            assert_eq!(code.len(), before + 1, "the far condition took a veneer");
+            assert_eq!(code[0] & 0xff00_001f, 0x5800_0000, "ldr x0, literal");
+            let at = ((code[0] >> 5) & 0x7_ffff) as usize;
+            assert_eq!(
+                (code[at], code[at + 1]),
+                (value as u32, (value >> 32) as u32)
+            );
         }
 
         #[test]
@@ -7423,7 +7509,7 @@ fn compile_entry(
         .drain(ops.len()..)
         .map(|offset| offset as usize / 4)
         .collect();
-    skip_unused_callee_saved_fp(&mut words, &fp_saves, fp_callee_saved);
+    skip_unused_callee_saved_fp(&mut words, &fp_saves, fp_callee_saved, &[]);
     // Debug: `TRUST_JS_JIT_CODEDUMP=<substr>` prints the finished code words (hex, one per line)
     // of chunks whose leading slot names contain the substring (`*`: every chunk) — round-trip
     // them through `clang -c` + `objdump -d` for a disassembly of exactly what runs. `names@N`
@@ -7670,7 +7756,9 @@ fn writes_callee_saved_fp(word: u32) -> bool {
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
-fn skip_unused_callee_saved_fp(words: &mut [u32], at: &[usize], writes: bool) {
+/// `data`: the first word of each doubleword of data the code holds (the tier's validity word's
+/// literal, F4 part 2), which the debug scan for SIMD&FP writes skips as it skips a veneer's.
+fn skip_unused_callee_saved_fp(words: &mut [u32], at: &[usize], writes: bool, data: &[usize]) {
     // stp x29, x30, [sp, #-size]! and ldp x29, x30, [sp], #size
     let push = |size: u32| {
         0xA980_0000 | (((size / 8).wrapping_neg() & 0x7f) << 15) | (30 << 10) | (31 << 5) | 29
@@ -7694,10 +7782,12 @@ fn skip_unused_callee_saved_fp(words: &mut [u32], at: &[usize], writes: bool) {
             })
         };
         assert!(
-            !words
-                .iter()
-                .enumerate()
-                .any(|(k, &word)| !group(k) && !veneer(k) && writes_callee_saved_fp(word)),
+            !words.iter().enumerate().any(|(k, &word)| {
+                !group(k)
+                    && !veneer(k)
+                    && !data.iter().any(|&at| (at..at + 2).contains(&k))
+                    && writes_callee_saved_fp(word)
+            }),
             "a SIMD&FP instruction bypassed Asm::emit_fp"
         );
     }
