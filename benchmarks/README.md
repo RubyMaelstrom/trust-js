@@ -78,6 +78,21 @@ Instruction counts (`perf stat -e instructions:u`)
   it too; compare the collector's log (`TRUST_JS_GC_LOG=1`: the major collections'
   object counts and slice counts) before looking for a cause in the change. This
   holds for a change to the collector as much as for any other.
+- Octane's TypeScript at five fixed runs has two collector modes about 1% of its
+  instructions apart, with the marker off as well: each run builds a compiler, and
+  whether the conservative scan happens to keep the previous run's alive decides how
+  often the collector runs afterwards (8 major collections against 12). Which mode a
+  run draws depends on the binary and on the address layout: one build drew the lighter
+  mode in 10 of 10 runs at randomized addresses, the next in 2 of 10, so neither fixed
+  addresses nor a mean over randomized runs compares two builds. Compare the mutator's
+  instructions instead. Record each run (`perf record -e instructions:u -c 1000000 -g
+  --user-callchains`, one recording at a time, randomized addresses, no tier or collector
+  log, since logging moves the draw) and count as the collector's every sample whose
+  call chain passes through a collection (`Interp::with_raw_access::<CollectionOutcome,
+  ..>`); the rest is the mutator's. Its spread is 0.03% to 0.05% a run, and two builds of
+  equal generated code that drew opposite collector modes (totals 1.05% apart) agreed
+  to 0.02% on it. Report the collector's part beside it. Splay and Earley-Boyer showed
+  no second mode at this length.
 - PdfJS yields after a time slice of the real clock, so its count follows the machine's
   speed. Give it a deterministic clock before drawing a verdict from it.
 - Under about 1.5%, a difference can be layout: a template's size flipping an admission
