@@ -7129,3 +7129,59 @@ recording: a test build verifies the heap at every collection, so a test that al
 loop of thousands of turns runs for an hour or more under GC stress, and the tests of
 by-literal frames are the slowest (one has never finished in six hours); the stress leg of a
 change's check should name the tests it runs.
+
+The register allocator's rule B landed (d6722c0e; 2026-11-19; target/p3/stage3/behind-impl,
+proposal.txt, rule-b-text.txt and report-rule-b.txt, the agents'; the coordinator's checks
+target/p3/stage3/regb-review). It came out of the question where graph was behind the splice.
+Crypto's +0.66% was one reload an iteration of its hottest loops: an inlined frame's callee
+and receiver are read by nothing in the loop but its exit states, the allocator counted a
+state's read as a read, and with every register held it spilled a value the loop does read.
+The same pattern, with no inlining involved, sat in zlib's and Mandreel's loops in both modes.
+- The rule. The allocator gives a value one home for its whole range, so the victim is the
+  held value whose whole range is cheapest in memory (Ion's spill weight: its register reads
+  and its definition's store, each weighed by loop depth, over the range's length), where a
+  state's read weighs nothing (TurboFan's frame-state inputs and Ion's snapshot uses claim no
+  register either), and a value that the loop around the choice has already read in a
+  register this turn is never the victim (Maglev's rule for loops). The commit's message has
+  it exactly as coded, with the citations.
+- Measured against main's engine (fat LTO; the coordinator's builds target/p2/lto/8edf64c4
+  and 8aa28538; instructions at 200 fixed runs, graph | splice, each row the same with
+  collections deferred): zlib -3.31% | -3.31%, Mandreel -2.91% | -2.90%, Crypto -1.44% |
+  -0.75%, Richards -1.01% | -1.87%, Earley-Boyer -0.38% | -0.26%, DeltaBlue -0.28% | -0.07%,
+  Box2D -0.24% | -0.20%; the rest within 0.17%, none slower beyond 0.07%. Cycles on one X925
+  core, five rounds: zlib and Mandreel at 5 runs -5.4% | -5.3% and -5.1% | -5.3%, Crypto -5.1%
+  | -3.9%, Richards -1.2% | -3.3%, DeltaBlue -1.1% | -1.2%, React's steady state -4.2% at
+  graph. The gain in cycles is several times the gain in instructions: a reload is a load
+  that waits on a store.
+- The forms tried, each measured on the whole table (the agents' p1 to p5): the next register
+  read alone, and the weight alone, cost Richards +1.3% to +1.4% instructions and +6% cycles
+  at graph (values read early in the scheduler's loop turn and then held for exits became
+  victims, and with one home their earlier reads turned into loads); the loop term alone cost
+  the Vue fixture +0.41% and a third of the gain; the term over every enclosing loop cost
+  Crypto +5.4%. The recorded limit: a static weight sees loop depth and not how often a block
+  runs; Richards still pays two stores and two loads a task turn for two values read on
+  conditional paths.
+- Tests. Twenty-three existing tests of the allocator's step R1 had setups that pinned their
+  victims by the old rule (the whole library suite at graph and with the tier on was the net
+  that found the seven outside the allocator's own module). Each is set up again under the
+  weight and catches every mutation it caught before, the ported mutations first shown
+  faithful on the parent. One of R1's mutations had been caught by nothing since an earlier
+  change made its test vacuous; the rewritten test catches it. The coordinator's 75
+  adversarial programs agree at four modes and under GC stress at graph and at the splice
+  (an allocator change moves every value's home, and the collector finds values by their
+  homes); the 5-run verifier sweep is clean.
+- Not built, on this evidence: the guarded way's callee as a constant of its frame (V8's and
+  JSC's form). After rule B its remaining reach is at most 0.005% of any workload, and it
+  would need a new rooting rule (running code keeping its embedded callees alive).
+- The flip's rows on this engine (graph against the splice, instructions at 200 runs):
+  DeltaBlue -16.2%, Richards -9.6%, Box2D -2.2%, TypeScript -1.2% (not read by the mutator's
+  instructions here), Earley-Boyer -1.0%, RayTrace -0.4%, Mandreel -0.4%, Crypto -0.22%
+  (it was +0.66%), PdfJS -0.1%, zlib, RegExp, Navier-Stokes and CodeLoad level; behind: GBEMU
+  +0.17% and Splay +0.11% with the marker off. Both remaining gaps are the context switches
+  graph makes around operations it has not lowered in inlined frames (the agents' attribution:
+  Splay's are stores that mix replacing and creating a property, which are generic in both
+  modes; GBEMU's are spread over property reads). The follow-on pieces by predicted gain at
+  graph: the lazy switch for property reads in inlined frames (DeltaBlue 1.15%, Vue's steady
+  state 0.67%, TypeScript 0.43%), the lowered mixed store (Splay 0.82%, the one that also
+  gains at the splice), the intrinsic call as a node (DeltaBlue 0.32%).
+- The owner's decision of the same day stands on this: the flip follows rule B's landing.
