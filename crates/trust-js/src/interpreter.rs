@@ -4403,7 +4403,7 @@ impl StubEntry {
 }
 
 /// Stub-cache capacity (power of two). 4096 × 40-byte entries = 160 KiB.
-const STUB_CACHE_SIZE: usize = 4096;
+pub(crate) const STUB_CACHE_SIZE: usize = 4096;
 const COMPUTED_STUB_KEY_MAX_BYTES: usize = 256;
 
 /// Whether a named read of `name` is left to the general [[Get]] rather than the property ICs'
@@ -4706,6 +4706,9 @@ pub(crate) struct InterpLayout {
     pub call_overflow_shift: usize,
     pub computed_read_sets: usize,
     pub computed_read_mask: usize,
+    /// `stub_cache`: the engine-wide property cache's entries (a boxed array: one pointer), which
+    /// the shared read stubs probe through `ctx.interp` (the megamorphic line's piece 1b).
+    pub stub_cache: usize,
     pub valid: bool,
 }
 
@@ -4785,6 +4788,7 @@ pub(crate) fn interp_layout(i: &mut Interp) -> InterpLayout {
         call_overflow_shift: off(&i.call_overflow.hash_shift as *const _ as usize),
         computed_read_sets: off(&i.computed_reads.raw_sets as *const _ as usize),
         computed_read_mask: off(&i.computed_reads.mask as *const _ as usize),
+        stub_cache: off(&i.stub_cache as *const _ as usize),
         valid: true,
     }
 }

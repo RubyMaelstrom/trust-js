@@ -280,6 +280,14 @@ mod array_absent_tests;
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
+#[path = "jit_mega_read_tests.rs"]
+mod mega_read_tests;
+
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 #[path = "jit_chain_reoptimize_tests.rs"]
 mod chain_reoptimize_tests;
 
@@ -3207,13 +3215,14 @@ mod shared_stub_tests {
             any(target_os = "macos", target_os = "linux", target_os = "windows")
         ))]
         {
-            for bits in 0..16u32 {
+            for bits in 0..32u32 {
                 keys.push(
                     SharedStub::PropWays(PropProbeFlags {
                         arr_ok: bits & 1 != 0,
                         wrap_ok: bits & 2 != 0,
                         method: bits & 4 != 0,
                         kc: bits & 8 != 0,
+                        mega: bits & 16 != 0,
                     })
                     .key(),
                 );
@@ -8396,6 +8405,11 @@ struct PropProbeFlags {
     method: bool,
     /// Key-checked Array holder states route to the site's key compare.
     kc: bool,
+    /// The engine-wide cache's probe after the ways (`emit_mega_way`), with the site's key word
+    /// in x6: a site whose code was made cold (the compact read, which passes its key for the
+    /// key-checked arm anyway) or whose ways held the generic mark when it was made. Another site
+    /// passes no key and takes no probe.
+    mega: bool,
 }
 
 #[cfg(all(
@@ -8443,6 +8457,8 @@ fn emit_prop_way_probe(
         wrap_ok,
         method,
         kc,
+        // The way probe is the same for the cache's entry (`emit_mega_way`).
+        mega: _,
     } = flags;
     let obj_off = layout.obj_from_cell as u32;
     let ex = layout.obj_kind as u32;
@@ -8695,6 +8711,195 @@ fn emit_prop_way_loop(
     a.b(miss);
 }
 
+/// A receiver (x10) whose object is not ic-plain (a typed array, `arguments`, a Proxy, an exotic
+/// with own lookups) branches to `miss`: no way and no engine-wide cache entry validates it,
+/// because `emit_prop_way_probe` requires the flag at the receiver's hop of every state. Two
+/// instructions; clobbers x15.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_plain_receiver_test(a: &mut asm::Asm, layout: &crate::value::JitLayout, miss: usize) {
+    a.ldrb_imm(15, 10, (layout.obj_from_cell + layout.obj_flags) as u32);
+    a.tbz(15, flag_bit(crate::value::FLAG_IC_PLAIN), miss);
+}
+
+/// The engine-wide property cache probed by generated code (the megamorphic line's piece 1b), at
+/// a megamorphic site whose ways missed: x8 = just past the site's last way (as the way loop
+/// leaves it), x6 = the site's key word, x10 = the receiver (or a primitive's wrapper prototype,
+/// as the way loop reads it). The entry the receiver's shape and the key select (`Interp`'s `stub_slot`)
+/// is taken when its key is the site's, and then validated exactly as a way of the site's own:
+/// `emit_prop_way_probe` on its state (x12), with the same landings (a validated data hit, a
+/// key-checked holder, a cached absence, and an accessor, which the caller publishes for the
+/// helper's validated path). Anything else branches to `miss`. Process-wide: the table is found
+/// through `ctx.interp` (x19's word at 72), never embedded, and the key comes from the site. The
+/// exemplars' megamorphic loads probe their one engine-wide cache this way from a shared stub:
+/// SpiderMonkey's Warp trampoline megamorphicLoadStub (jit/CodeGenerator.cpp:4916-4970,
+/// MacroAssembler.cpp:3144-3203), V8's LoadIC_Megamorphic builtin (ic/accessor-assembler.cc:
+/// 3244-3315, 4744-4799). Without the interpreter's layout (layout-only harnesses) it branches to
+/// `miss`. Clobbers x9, x11..x17 and NZCV; x6 and x10 are preserved.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[allow(clippy::too_many_arguments)]
+fn emit_mega_way(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    il: Option<&crate::interpreter::InterpLayout>,
+    flags: PropProbeFlags,
+    plain_tested: bool,
+    miss: usize,
+    load: usize,
+    load_kc: usize,
+    absent_hit: usize,
+) {
+    use crate::interpreter::{StubEntry, STUB_CACHE_SIZE};
+    let Some(il) = il.filter(|il| il.valid && il.stub_cache.is_multiple_of(8)) else {
+        a.b(miss);
+        return;
+    };
+    const _: () = assert!(std::mem::offset_of!(StubEntry, key) == 0);
+    let state = std::mem::offset_of!(StubEntry, st) as u32;
+    let stride = std::mem::size_of::<std::cell::Cell<StubEntry>>() as u32;
+    // Only a megamorphic site probes the table: one whose way 0 holds the generic mark
+    // (`IC_MID_GENERIC`: a fill evicted a live way, or one was refused). A site short of that
+    // takes the helper, whose fill teaches its own ways, which the tier reads; were the table to
+    // serve it (another site's entry for the same shape and key), its ways would stay empty. The
+    // exemplars probe their engine-wide cache only from a site whose own state is megamorphic:
+    // V8's IC copies itself into the stub cache on going MEGAMORPHIC (ic/ic.cc:1059-1066),
+    // JSC's baseline IC folds into its megamorphic case after 8 cases
+    // (bytecode/InlineCacheCompiler.cpp:4680-4752), SpiderMonkey attaches MegamorphicLoadSlot in
+    // its Megamorphic mode (jit/CacheIR.cpp:1293-1298). The way loop leaves x8 past the last way.
+    // A receiver that is not ic-plain (a typed array, `arguments`, a Proxy) validates no entry
+    // (`emit_prop_way_probe` refuses it first): it takes the helper before the gate and the
+    // table's loads (where the caller has not tested it before the ways, `plain_tested`).
+    if !plain_tested {
+        emit_plain_receiver_test(a, layout, miss);
+    }
+    let ways = (crate::bytecode::PROP_IC_WAYS
+        * std::mem::size_of::<std::cell::Cell<crate::bytecode::IcState>>()) as u32;
+    a.sub_imm(15, 8, ways);
+    a.ldrb_imm(15, 15, crate::bytecode::IC_OFF_MID_OK);
+    a.tbz(15, crate::bytecode::IC_MID_GENERIC.trailing_zeros(), miss);
+    a.ldr_imm(16, 19, 72); // ctx.interp
+    if il.stub_cache / 8 < 4096 {
+        a.ldr_imm(16, 16, il.stub_cache as u32);
+    } else {
+        a.mov_imm64(17, (il.stub_cache / 8) as u64);
+        a.ldr_x_lsl3(16, 16, 17);
+    }
+    // The slot: ((n ^ n >> 7) ^ shape) & (size - 1), n = the key's word >> 3 (`stub_slot`).
+    a.ldr_w_imm(
+        13,
+        10,
+        (layout.obj_from_cell + layout.obj_props + layout.props_shape) as u32,
+    );
+    a.lsr_imm(14, 6, 3);
+    a.lsr_imm(15, 14, 7);
+    a.logic_x(2, 14, 14, 15);
+    a.logic_x(2, 14, 14, 13);
+    a.logic_imm_w(
+        0,
+        14,
+        14,
+        asm::logical_imm_w(STUB_CACHE_SIZE as u32 - 1).expect("a mask of low bits"),
+    );
+    a.movz(15, stride, 0);
+    a.madd(12, 14, 15, 16);
+    a.ldr_imm(15, 12, 0);
+    a.cmp_reg_x(15, 6);
+    a.b_cond(C_NE, miss);
+    a.add_imm(12, 12, state);
+    // An entry the way probe cannot serve goes to the helper before the receiver's checks and
+    // the walk, whose every step it would pay to miss in the end: what the probe serves is a
+    // data or accessor state at depth 3 or less, a cached absence (not at a method read), and a
+    // key-checked Array holder at depth 0 or 1 (where the site checks keys). Deeper states and
+    // key checks beyond one hop are the Rust probe's.
+    use crate::bytecode::{IC_ABSENT, IC_ACCESSOR, IC_ARR_KEYCHK, IC_OFF_DEPTH};
+    let serve = a.new_label();
+    a.ldrb_imm(9, 12, IC_OFF_DEPTH);
+    a.logic_imm_w(
+        0,
+        15,
+        9,
+        asm::logical_imm_w(!u32::from(IC_ACCESSOR)).expect("one bit cleared"),
+    );
+    a.cmp_imm_w(15, 3);
+    a.b_cond(C_LS, serve);
+    if !flags.method {
+        a.cmp_imm_w(9, u32::from(IC_ABSENT));
+        a.b_cond(C_EQ, serve);
+    }
+    if flags.kc {
+        a.logic_imm_w(0, 15, 9, asm::logical_imm_w(!1).expect("one bit cleared"));
+        a.cmp_imm_w(15, u32::from(IC_ARR_KEYCHK));
+        a.b_cond(C_EQ, serve);
+    }
+    a.b(miss);
+    a.bind(serve);
+    // A validated entry is promoted into the site's ways before its landing, as the helper's
+    // probe of the cache promotes its hit (`Interp::try_ic_get` -> `ic_insert`): the ways shift
+    // one down, way 0 takes the entry with the site's generic mark, and the site's ways keep
+    // following its receivers (a site whose baked ways and ways together cover its shapes stops
+    // reaching the cache). The landings read the entry's words, which equal way 0's.
+    let (p_load, p_kc, p_absent) = (a.new_label(), a.new_label(), a.new_label());
+    emit_prop_way_probe(a, layout, flags, miss, p_load, p_kc, p_absent);
+    for (promote, landing) in [(p_load, load), (p_kc, load_kc), (p_absent, absent_hit)] {
+        a.bind(promote);
+        emit_mega_promote(a);
+        a.b(landing);
+    }
+}
+
+/// The engine-wide cache's validated entry (x12) promoted into a site's ways, as
+/// `Interp::ic_insert` does for a generic site: ways 0..2 move to 1..3, way 0 takes the entry with
+/// the generic mark (`IC_MID_GENERIC`). x8 = just past the site's last way (as the way loop leaves
+/// it). Clobbers x15..x17; x11..x13 are preserved.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_mega_promote(a: &mut asm::Asm) {
+    use crate::bytecode::{IcState, IC_MID_GENERIC, IC_OFF_MID_OK, PROP_IC_WAYS};
+    let stride = std::mem::size_of::<std::cell::Cell<IcState>>();
+    const _: () = assert!(std::mem::size_of::<IcState>() == 32);
+    a.sub_imm(15, 8, (PROP_IC_WAYS * stride) as u32);
+    for way in (1..PROP_IC_WAYS).rev() {
+        for half in [0, 16] {
+            a.ldp_base(16, 17, 15, ((way - 1) * stride + half) as i32);
+            a.stp_base(16, 17, 15, (way * stride + half) as i32);
+        }
+    }
+    for half in [0, 16] {
+        a.ldp_base(16, 17, 12, half);
+        a.stp_base(16, 17, 15, half);
+    }
+    a.ldrb_imm(16, 15, IC_OFF_MID_OK);
+    a.logic_imm_w(
+        1,
+        16,
+        16,
+        asm::logical_imm_w(u32::from(IC_MID_GENERIC)).expect("one bit"),
+    );
+    a.strb_imm(16, 15, IC_OFF_MID_OK);
+}
+
+/// The key word a named read site passes its read stubs in x6 for the engine-wide cache's probe
+/// (`emit_mega_way`): its name's key, or for a site with no name a word no key has (an index
+/// key's tag with an index past the largest).
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn mega_key_word(name: JitName<'_>) -> u64 {
+    if name.text.is_empty() {
+        u64::MAX
+    } else {
+        name.key_word()
+    }
+}
+
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -8748,9 +8953,11 @@ fn emit_packed_probe_receiver(
 /// read outside loops would otherwise carry at every site (see [`emit_prop_read_site`]) — the
 /// way loop over the site's cache, the landings (the slot's bounds and word, the accessor test
 /// and its publication, the deferred `prototype` guard, the key-checked arm, a cached absence)
-/// and the commit. Every decline before the commit returns w9 = 0 with the operands as they
-/// were. Process-wide: the key word the key-checked arm compares comes from the site (x6), never
-/// from this code. Clobbers x6..x17 and NZCV.
+/// and the commit; after the ways, the engine-wide cache's entry (`emit_mega_way`), landing as a
+/// way. Every decline before the commit returns w9 = 0 with the operands as they were.
+/// Process-wide: the key word the key-checked arm and the cache's probe compare comes from the
+/// site (x6), never from this code, and the cache is found through `ctx.interp`. Clobbers x6..x17
+/// and NZCV.
 fn emit_prop_read_stub(
     a: &mut asm::Asm,
     layout: &crate::value::JitLayout,
@@ -8769,7 +8976,24 @@ fn emit_prop_read_stub(
         let il = il.expect("a wrapper receiver's read stub is requested by chunk compilation");
         emit_packed_probe_receiver(a, il, slow);
     }
-    emit_prop_way_loop(a, layout, probe, slow, load_way, load_kc_way, absent_hit);
+    // The site's ways missed: the engine-wide cache's entry for the receiver's shape and the
+    // site's key (x6), validated as a way and landing as one (the megamorphic line's piece 1b).
+    let mega = if probe.mega { a.new_label() } else { slow };
+    emit_prop_way_loop(a, layout, probe, mega, load_way, load_kc_way, absent_hit);
+    if probe.mega {
+        a.bind(mega);
+        emit_mega_way(
+            a,
+            layout,
+            il,
+            probe,
+            false,
+            slow,
+            load_way,
+            load_kc_way,
+            absent_hit,
+        );
+    }
     // x13 = the slot's index (bounds-checked against the live count), x14 = its location word.
     let emit_entry = |a: &mut asm::Asm| {
         named_len(a, layout, 16, 11);
@@ -8922,11 +9146,9 @@ fn emit_prop_read_site(
         emit_exec_payload(a, 9, 10);
     }
     a.mov_imm64(8, cache_ptr as u64);
-    if flags.probe.kc {
-        // The site's key word: an atom's address, which lives as long as the heap this code
-        // belongs to, or a tagged index.
-        a.mov_imm64(6, name.key_word());
-    }
+    // The site's key word (the key-checked arm's compare and the engine-wide cache's probe): an
+    // atom's address, which lives as long as the heap this code belongs to, or a tagged index.
+    a.mov_imm64(6, mega_key_word(name));
     let stub = a.shared_stub(SharedStub::PropRead(flags).key());
     a.bl_label(stub);
     #[cfg(not(test))]
@@ -9102,6 +9324,8 @@ fn emit_prop_load_inline(
                 wrap_ok,
                 method,
                 kc,
+                // Made cold: the site may turn megamorphic after (its key passes anyway).
+                mega: true,
             },
             push: method || !matches!(recv, PropRecv::Stack),
             proto: name.text == "prototype",
@@ -9273,6 +9497,7 @@ fn emit_prop_load_inline(
                 wrap_ok,
                 method,
                 kc: false,
+                mega: false,
             },
             push: method || !matches!(recv, PropRecv::Stack),
             proto: name.text == "prototype",
@@ -9307,14 +9532,23 @@ fn emit_prop_load_inline(
     // cell, x10 = receiver); it reports which landing validated in w9. With stubs disabled, the
     // same loop is emitted at the site.
     if compact.is_none() {
+        // The engine-wide cache's probe only for a site whose ways held the generic mark when
+        // its code was made: another passes no key word (a polymorphic site's way stub call is
+        // a common path; the measured cost of passing it everywhere is in mega-impl/p1).
+        let mega = ways[0].mid_ok & crate::bytecode::IC_MID_GENERIC != 0;
         let flags = PropProbeFlags {
             arr_ok,
             wrap_ok,
             method,
             kc,
+            mega,
         };
         a.mov_imm64(8, cache_ptr as u64);
         if shared_stubs_enabled() {
+            if mega {
+                // The site's key word, for the engine-wide cache's probe after the ways.
+                a.mov_imm64(6, mega_key_word(name));
+            }
             let stub = a.shared_stub(SharedStub::PropWays(flags).key());
             a.bl_label(stub);
             a.cbz(9, false, slow);
@@ -10226,6 +10460,7 @@ fn emit_get_prop_trap(
         wrap_ok: false,
         method: true,
         kc: false,
+        mega: false,
     };
     emit_prop_way_loop(a, layout, flags, unframe, load_way, unframe, unframe);
     a.bind(load_way);
@@ -10556,6 +10791,7 @@ fn emit_set_prop_setter(
         wrap_ok: false,
         method: true,
         kc: false,
+        mega: false,
     };
     a.ldr_imm(8, 4, offset_of!(AccessorSlot, cache) as u32);
     emit_prop_way_loop(a, layout, flags, plain, load, plain, plain);
@@ -17656,8 +17892,10 @@ enum SharedStub {
     /// from the running chunk's accessor table (which names no inline site for a callee's own
     /// chunk); everything else as the base stub. Template code never calls it.
     HelperInlined { idx: u8 },
-    /// [`emit_prop_way_loop`]: x8 = a site's first `IcState` cell, x10 = receiver → w9 = 0 or a
-    /// `PROP_PROBE_*` landing, with x11 = holder base and x13 = slot for the data landings.
+    /// [`emit_prop_way_loop`]: x8 = a site's first `IcState` cell, x10 = receiver, x6 = the site's
+    /// key word → w9 = 0 or a `PROP_PROBE_*` landing, with x11 = holder base, x13 = slot and x12 =
+    /// the validated state (a way, or the engine-wide cache's entry, `emit_mega_way`) for the data
+    /// landings.
     #[cfg(all(
         target_arch = "aarch64",
         any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -17926,6 +18164,7 @@ impl SharedStub {
                     | u32::from(flags.wrap_ok) << 1
                     | u32::from(flags.method) << 2
                     | u32::from(flags.kc) << 3
+                    | u32::from(flags.mega) << 4
             }
             #[cfg(all(
                 target_arch = "aarch64",
@@ -17939,6 +18178,7 @@ impl SharedStub {
                     | u32::from(flags.probe.kc) << 3
                     | u32::from(flags.push) << 4
                     | u32::from(flags.proto) << 5
+                    | u32::from(flags.probe.mega) << 6
             }
             #[cfg(all(
                 target_arch = "aarch64",
@@ -18092,6 +18332,7 @@ impl SharedStub {
                 wrap_ok: key & 2 != 0,
                 method: key & 4 != 0,
                 kc: key & 8 != 0,
+                mega: key & 16 != 0,
             }),
             #[cfg(all(
                 target_arch = "aarch64",
@@ -18103,6 +18344,7 @@ impl SharedStub {
                     wrap_ok: key & 2 != 0,
                     method: key & 4 != 0,
                     kc: key & 8 != 0,
+                    mega: key & 64 != 0,
                 },
                 push: key & 16 != 0,
                 proto: key & 32 != 0,
@@ -18248,6 +18490,7 @@ impl SharedStub {
                     ("wrap_ok", flags.wrap_ok),
                     ("method", flags.method),
                     ("kc", flags.kc),
+                    ("mega", flags.mega),
                 ],
             ),
             SharedStub::PropRead(flags) => named(
@@ -18257,6 +18500,7 @@ impl SharedStub {
                     ("wrap_ok", flags.probe.wrap_ok),
                     ("method", flags.probe.method),
                     ("kc", flags.probe.kc),
+                    ("mega", flags.probe.mega),
                     ("push", flags.push),
                     ("proto", flags.proto),
                 ],
@@ -18462,7 +18706,30 @@ impl SharedStub {
                 let load = a.new_label();
                 let load_kc = a.new_label();
                 let absent = a.new_label();
-                emit_prop_way_loop(a, layout, flags, miss, load, load_kc, absent);
+                // The site's ways missed: the engine-wide cache's entry for the receiver's
+                // shape and the site's key (x6), validated and landing as a way (piece 1b).
+                // A megamorphic site's receiver that is not ic-plain, which no way validates
+                // either, takes the helper before the ways (GBEMU's typed arrays at the sites
+                // they keep generic: the way loop's four refusals are the most of its path).
+                let mega = if flags.mega { a.new_label() } else { miss };
+                if flags.mega {
+                    emit_plain_receiver_test(a, layout, miss);
+                }
+                emit_prop_way_loop(a, layout, flags, mega, load, load_kc, absent);
+                if flags.mega {
+                    a.bind(mega);
+                    emit_mega_way(
+                        a,
+                        layout,
+                        context.ilayout,
+                        flags,
+                        true,
+                        miss,
+                        load,
+                        load_kc,
+                        absent,
+                    );
+                }
                 for (landing, status) in [
                     (miss, 0),
                     (load, PROP_PROBE_LOAD),
