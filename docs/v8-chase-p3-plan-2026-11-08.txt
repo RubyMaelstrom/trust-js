@@ -7590,3 +7590,37 @@ A test broken by the loop's facts, found a landing later and fixed forward (ce0e
   jit::opt_a64) in ONE configuration, TRUST_JS_OPT=1 with the inline mode left to the
   default. The coordinator's landing check of a tier change runs it from here on, beside the
   counts; the whole library suite stays for changes to every program's default path.
+
+The graph line's piece 1 landed: the lazy context switch with explicit inputs (844667b7;
+2026-11-19; target/p3/stage3/gnext-impl, report-p1.txt and design-note.txt, the agent's; the
+coordinator's check target/p3/stage3/g1-review).
+- The rule. An inlined frame's generic node of an admitted kind writes before its template
+  only its operand words; a kind whose template read its receiver from a fixed place (`this`,
+  a slot of the window) reads it from an operand word in the form the tier asks for; the
+  frame's chunk, call site, `this` word and the window's description are written only around
+  the template's helper calls and restored there. JSC's form (a store before a call out and
+  nowhere else, DFGSpeculativeJIT.h:1078-1097), with the receiver an input as Maglev's and
+  the DFG's generic nodes take it. The tier off's templates are unchanged (every receiver
+  load goes through one function, jit.rs emit_receiver_load). Admitted: GetProp, GetMethod,
+  GetPropThis, GetPropLocal, SetPropDrop, SetPropThisDrop, SetPropLocalDrop,
+  SetElemLocalDrop, GetMethodElem, InstanceOf, Add, ToStr, MakeObject, MakeArray,
+  MakeArrayLiteral. Not admitted: the kinds whose generic sites reach the helper on every
+  execution (GetElem, GetElemLocal, SetElemDrop, the relationals) and those whose template
+  is a helper call alone.
+- Measured, the coordinator's builds against main's engine (fat LTO, target/p2/lto/6516b34a
+  against 632b3cc2; graph; 200 fixed runs, collections deferred), with the count's
+  prediction: DeltaBlue -0.86% (-0.85%), Splay -1.99% (the agent's row with the marker off
+  and collections not deferred: -0.82%, predicted -0.83%), GBEMU -0.22% (-0.22%), RayTrace
+  -0.20% (-0.20%), Crypto -0.09% (-0.09%), Box2D -0.04% (-0.06%). At 5 runs: Splay -0.66%,
+  Vue's fixture -0.29% and steady state -0.23%, Djot's steady state -0.21%, RayTrace -0.10%,
+  Octane's mean -0.09%. The splice and the tier off equal within the draws of two binaries
+  (the agent's code comparison: the tier off's and the splice's generated code differ only
+  in how many instructions a heap address takes to materialize). The agent's GBEMU row at 5
+  runs, +0.04% against an older parent, reads -0.07% against main's engine.
+- Checked: the coordinator's 87 adversarial programs at five modes and again under GC stress
+  at graph (the piece changes what a helper path tells the collector): none differs; the
+  tier's modules with the tier on on the landing tree, 766 passed and none failed; the
+  verifier sweep; the agent's eight mutations, its new tests of each helper path from an
+  inlined frame (a getter, a setter, a Proxy receiver, a null receiver's error and stack,
+  valueOf, Symbol.hasInstance), zombie's check.
+- Next of the line: piece 2, the polymorphic named store (briefs/graph-piece2.txt).
