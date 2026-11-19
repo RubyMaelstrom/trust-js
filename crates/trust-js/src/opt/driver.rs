@@ -1764,9 +1764,20 @@ fn land(
 /// instruction barrier (`finish`), which also covers the stubs the compile made (P3 stage 2, step
 /// 17); a panic on the compile thread is raised here.
 pub(crate) fn install_finished(i: &mut Interp) {
-    if !i.poll.take_install_request() {
-        return;
+    if i.poll.take_install_request() {
+        install_requested(i);
     }
+}
+
+/// [`install_finished`]'s installs, out of line: `jit_interrupt` stays on the stack across the
+/// collection its `gc_check` may start, and the conservative scan reads its whole frame, so the
+/// frame keeps none of a compile's results (whose stale words would keep garbage alive, and
+/// whose types' sizes would move every collection's retention). V8's interrupt handler and
+/// SpiderMonkey's interrupt callback likewise reach the install through a call of its own
+/// (execution/stack-guard.cc:353-372, OptimizingCompileDispatcher::InstallOptimizedFunctions and
+/// the Maglev dispatcher's FinalizeFinishedJobs; vm/Runtime.cpp:421, AttachFinishedCompilations).
+#[inline(never)]
+fn install_requested(i: &mut Interp) {
     let Some(results) = i.opt_pending.results.clone() else {
         return;
     };
