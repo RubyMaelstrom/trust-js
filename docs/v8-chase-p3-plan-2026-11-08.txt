@@ -7746,3 +7746,46 @@ target/p3/stage3/l2-review).
 - Next, built and being measured on the same branch: layer 3 (the tier folds a global whose
   value is a Number and has been stored once: first rows Richards -4.7% at graph and -4.0%
   at the splice, Crypto -0.5%, at 200 runs) and the fuses kept with the Agent's heap.
+
+F4 part 2, layer 3 landed: the tier folds a global whose value is a Number stored once
+(ef27a756; 2026-11-19; target/p3/stage3/f4p2-impl, report-l3.txt, the agent's; the coordinator's
+check target/p3/stage3/l3-review). The owner's question 7, answered that morning, is now
+measured.
+- What it is. A read of a global property whose state is Constant and whose value is a
+  Number becomes that number in the tier's code, behind one CheckCodeValid since the last
+  effect; the compile registers the code on the property's dependents at install; the
+  property's next change sets the code's word, and the code leaves at its next test with
+  Invalidated and is discarded. V8 folds a constant property cell's value under
+  DependOnGlobalProperty, JSC a watchpointed global's, SpiderMonkey a fuse-guarded one's; the
+  test after calls where the tier already tests is the owner's choice of the three ways
+  running code can learn (V8's return-address exit later, on numbers). The fold is on by
+  default with the tier (TRUST_JS_OPT_FOLD_GLOBALS=0 turns it off for diagnosis).
+- Measured, the coordinator's builds (fat LTO, target/p2/lto/b614f6d8 against layer 2's
+  2c299ca7; 200 fixed runs, collections deferred; graph | the splice): Richards -4.75% |
+  -4.02% (the design's ceiling from a build with no invalidation at all: -5.4%), Crypto
+  -0.47% | -0.46%. At 5 runs at graph: Richards -1.81%, Crypto -0.36%, Octane's mean -0.18%;
+  the tier off equal. The agent's rows for GBEMU, Mandreel, Box2D and DeltaBlue: within
+  0.02% (Mandreel's globals hold typed arrays: layer 4). With the fold switched off on the
+  same binary every row equals main's.
+- Always wrong, the agent's micros: a global stored every iteration is never folded (0
+  invalidations, +0.001%); a thousand globals each changed once, read by a hundred functions:
+  300 invalidations and discards, 401 compiles, the hundred functions at the limit of three,
+  and the run still 11.7% under main's (the tier off: five times main's); a global stored
+  once after the compile: one invalidation, one exit, one discard, two compiles, and then
+  +6.8% on that micro, which is not the fold's: any discard on main costs the same there
+  (the plan's record "Two findings of 2026-11-19 evening").
+- Checked: the coordinator's 52 adversarial programs at seven modes (forced exits among
+  them), against the parent's engine and under GC stress at graph: none differs. Six are new
+  for the fold, each agreeing with Node first: the global changed through every plain
+  writer; -0 stored over +0 and NaN over NaN (1/K tells the zeros apart); the global changed
+  while the folding loop runs, from a callee, an inlined callee, valueOf, a getter, a Proxy
+  trap and a throw; made read-only, an accessor and back, deleted and added again, moved to
+  the global's prototype, replaced by a function declaration; eight globals with different
+  fates read together; a generator, an async function and a recursion reading it across
+  their suspensions and returns. The agent's: the tier's modules with the tier on on the
+  final tree (781 passed, none failed), Test262 with the tier on and eager 53,572 of 53,575,
+  the verifier sweep 42 of 42, four of five mutations caught (the fifth removes a guard that
+  only saves dead instructions; its debug assertion is the next agent's first item).
+- Next of the line (briefs/f4-part2-layer4.txt): a recount of what a fold still reaches by
+  the kind of value (typed arrays, functions, objects), since the day's loop work already
+  hoists Mandreel's global reads; then layer 4 for the kinds the count keeps.
