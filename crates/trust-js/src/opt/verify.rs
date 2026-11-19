@@ -23,7 +23,9 @@
 //! - a loop's entry speculation (stage 2 step 6), CheckNumber [PhiNotNumber] or CheckInt32
 //!   [PhiNotInt32], or a loop invariant's check moved to the loop's entry (P3 stage 3 step 0),
 //!   CheckNumber, CheckInt32, CheckObject or CheckElements [HoistingFailed], or a typed array's
-//!   TypedData checked there (step 0c) [HoistingFailed], or a loop's global read's own CheckEnvIs,
+//!   TypedData checked there (step 0c) [HoistingFailed], or the first CheckShape of an object a
+//!   quiet loop takes made there (the quiet loop's facts, commit 2) [HoistingFailed], or a loop's
+//!   global read's own CheckEnvIs,
 //!   CheckCellIs, CheckGlobalEpoch or CheckEnvGeneration made there (F4 part 1) [WrongName: a
 //!   WrongName check is one where it is built for the first pc of its block's one successor, from
 //!   outside that successor's loop], sits at the end of a
@@ -906,7 +908,7 @@ fn speculative(graph: &Graph, node: &Node, dom: &Dominators) -> bool {
 
 /// A loop's entry speculation `node`, at `position` among its block's phis and body: its check
 /// (CheckNumber for PhiNotNumber, CheckInt32 for PhiNotInt32, any of CheckNumber, CheckInt32,
-/// CheckObject, CheckElements and TypedData for HoistingFailed, and a loop's global read's own
+/// CheckObject, CheckElements, TypedData and CheckShape for HoistingFailed, and a loop's global read's own
 /// CheckEnvIs, CheckCellIs, CheckGlobalEpoch or CheckEnvGeneration for WrongName) at the end of a
 /// loop header's entry predecessor, after which nothing but other speculations exits or has an effect before the jump
 /// to the header, with a state at the header's pc and the header's handlers; or a HoistingFailed
@@ -938,6 +940,7 @@ fn speculation(
                 | NodeOp::CheckObject
                 | NodeOp::CheckElements(_)
                 | NodeOp::TypedData { .. }
+                | NodeOp::CheckShape { .. }
         ),
     };
     if !check {

@@ -837,8 +837,9 @@ impl<'g> Selector<'g> {
         anyway
     }
 
-    /// The sites step 0c's typed arrays' entry checks stand for (P3 stage 3 step L1c;
-    /// `PhiNotes::typed_entry`): each check's own reason at each of its receiver's typed sites,
+    /// The sites step 0c's typed arrays' entry checks and a quiet loop's first shape checks (the
+    /// quiet loop's facts, commit 2) stand for (P3 stage 3 step L1c; `PhiNotes::typed_entry`): each
+    /// check's own reason at each of its receiver's typed or named sites,
     /// keyed as the site's own check would exit (its pc in the loop's frame: the builder makes
     /// it at the site's pc), in the block of the first node built at that pc in that frame inside
     /// the loop (a site the build pruned counts as blind). One pass over the nodes for each loop

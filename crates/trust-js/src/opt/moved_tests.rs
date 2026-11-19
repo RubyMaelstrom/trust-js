@@ -309,10 +309,11 @@ type Case = (
     ExitReason,
 );
 
-/// Each kind the selector moves, and step 0c's typed array checks: an invariant the loop's
-/// condition checks (its function `lb`, the warm-up's value and the one after, the operation
-/// and the reason its check exits with).
-const CONVERGE: [Case; 5] = [
+/// Each kind the selector moves, step 0c's typed array checks and a quiet loop's first shape
+/// check (the quiet loop's facts, commit 2): an invariant the loop's condition checks (its
+/// function `lb`, the warm-up's value and the one after, the operation and the reason its check
+/// exits with).
+const CONVERGE: [Case; 6] = [
     (
         "int32",
         "function lb(a, n) { var s = 0; for (var i = 0; i < n; i++) s = s + a * i; return s; }",
@@ -355,6 +356,14 @@ const CONVERGE: [Case; 5] = [
         "F",
         |op| matches!(op, Op::GetElem | Op::GetElemLocal(..)),
         ExitReason::WrongElements,
+    ),
+    (
+        "shape",
+        "function lb(a, x) { var s = 0; for (var i = 0; i < x.n; i++) s = s + a * i; return s; }",
+        "{n: 8}",
+        "{n: 8, m: 0}",
+        |op| matches!(op, Op::GetProp(..) | Op::GetPropLocal(..)),
+        ExitReason::WrongShape,
     ),
 ];
 
@@ -427,6 +436,15 @@ fn a_blind_moved_check_keeps_hoisting_failed_and_flags_the_sites_that_run_anyway
             "bl(0, v)",
             "1.5",
             "'8'",
+        ),
+        // A quiet loop's first shape check (the quiet loop's facts, commit 2), of `p` read in the
+        // loop's body behind its test (blind): no add is flagged.
+        (
+            "shape",
+            "function bl(p, n) { var s = 0; for (var i = 0; i < n; i++) s = s + p.v; return s; }",
+            "(bl(v, 8) | 0)",
+            "{v: 1.5}",
+            "{v: 1.5, w: 0}",
         ),
     ];
     for graph_inline in [false, true] {

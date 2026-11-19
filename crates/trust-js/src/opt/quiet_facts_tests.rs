@@ -62,8 +62,20 @@ fn shape_checks(graph: &Graph) -> usize {
 
 /// `name`'s graph after `source` ran in template code.
 fn graph_after(source: &str, name: &str) -> Graph {
+    let _quiet = epoch_quiet();
     let mut engine = warmed(source);
     Compile::new(&mut engine, name).build().graph
+}
+
+/// The tests here that build graphs from call caches, and those that discard code, one at a time:
+/// a discard moves the call caches' process-wide epoch (`driver::move_epoch`), which stales a
+/// warm-up's call sites, so that a callee the graph would inline is a call (an effect) instead (as
+/// `inplace_tests::epoch_quiet` serializes its tests).
+fn epoch_quiet() -> std::sync::MutexGuard<'static, ()> {
+    static EPOCH_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    EPOCH_TESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[test]
@@ -580,6 +592,7 @@ fn a_cold_block_that_runs_exits_and_its_recompile_keeps_no_fact_its_operation_en
     // fact the operation ends: no heap fact for the global store and the call (effects), no
     // shape for the creation, p.x reloaded in the loop for the field store. Results are the tier
     // off's.
+    let _quiet = epoch_quiet();
     for (label, op) in COLD_OPS {
         let source = cold_source(op, "5", 2000, 4000);
         let expected = tier_off(&source);
@@ -631,6 +644,7 @@ fn a_cold_block_flagged_never_ran_is_built_and_its_loop_keeps_no_fact() {
     // predicate (`Rules::exits_unbuilt`), counts it, so that the loop keeps no heap fact. A prepass
     // that skipped the block would keep them, which the verifier refuses (`verify::kept_heap`).
     let source = cold_source(COLD_OPS[3].1, "100", 300, 300);
+    let _quiet = epoch_quiet();
     let mut engine = warmed(&source);
     let chunk = chunk_of(&mut engine, "f");
     let ops = chunk.jit_ops();
@@ -650,4 +664,289 @@ fn tier_off(source: &str) -> String {
     let mut engine = Engine::new();
     engine.set_tier(Tier::Bytecode);
     eval(&mut engine, source)
+}
+
+// ---- commit 2: a quiet loop's first shape check moved to its entry edge ----------------------
+
+/// The shape checks of `graph` made at a loop's entry edge: CheckShape exiting HoistingFailed.
+fn entry_shape_checks(graph: &Graph) -> Vec<NodeIx> {
+    nodes(graph, |node| {
+        matches!(node.op, NodeOp::CheckShape { .. })
+            && node.reason == Some(ExitReason::HoistingFailed)
+    })
+}
+
+/// The sites (pc, reason) the moved check `node` of `graph` stands for.
+fn sites_of(graph: &Graph, node: NodeIx) -> Vec<(u32, ExitReason)> {
+    graph
+        .moved
+        .iter()
+        .filter(|check| check.node == node)
+        .flat_map(|check| check.sites.iter().map(|site| (site.pc, site.reason)))
+        .collect()
+}
+
+#[test]
+fn a_quiet_loops_first_check_of_an_object_it_does_not_write_moves_to_its_entry() {
+    // p (a slot the loop reads and does not write), a method's `this` and an inlined frame's
+    // argument are first checked inside their loops: each shape is checked once, at the loop's
+    // entry edge [HoistingFailed], and nowhere in the loop, and the entry check stands for the
+    // sites of the object in the loop, each with its own reason [WrongShape]. The header keeps
+    // the fact (the carry), so the loop loads each field once per iteration with no check.
+    for (name, source) in [
+        (
+            "f",
+            "var o = {x: 1, y: 2};
+             function f(p, n) { var s = 0; for (var i = 0; i < n; i++) s = (s + p.x + p.y) | 0; return s; }
+             for (var k = 0; k < 40; k++) f(o, 20);",
+        ),
+        (
+            "run",
+            "function M() { this.x = 1; this.y = 2; }
+             function run(n) { var s = 0; for (var i = 0; i < n; i++) s = (s + this.x + this.y) | 0; return s; }
+             M.prototype.run = run;
+             var m = new M(); for (var k = 0; k < 40; k++) m.run(20);",
+        ),
+        (
+            "outer",
+            "var o = {x: 1, y: 2};
+             function sumf(p, n) { var s = 0; for (var i = 0; i < n; i++) s = (s + p.x + p.y) | 0; return s; }
+             function outer(q, n) { return sumf(q, n) + 1; }
+             for (var k = 0; k < 40; k++) outer(o, 20);",
+        ),
+    ] {
+        let graph = graph_after(source, name);
+        assert_eq!(shape_checks(&graph), 0, "{name}\n{}", dump(&graph));
+        let [entry] = entry_shape_checks(&graph)[..] else {
+            panic!("{name}: one entry check\n{}", dump(&graph))
+        };
+        let sites = sites_of(&graph, entry);
+        assert_eq!(sites.len(), 2, "{name}: x and y: {sites:?}");
+        assert!(
+            sites
+                .iter()
+                .all(|&(_, reason)| reason == ExitReason::WrongShape),
+            "{name}: {sites:?}"
+        );
+        assert!(
+            graph.kept.iter().any(|kept| kept.shapes),
+            "{name}: {:?}",
+            graph.kept
+        );
+    }
+}
+
+#[test]
+fn an_object_the_loop_writes_or_its_entry_already_checked_is_not_moved() {
+    // `w`: p written on a path of the loop, checked in the loop as before; `c`: p checked before
+    // the loop, the carry's fact, no entry check; `cr`: a loop that creates (its header keeps no
+    // shape), and `sw`: a string's walk through String.prototype on the word (no CheckShape
+    // passes a string), no entry check; `u`: the move off (the test seam), checked in the loop.
+    let source = "var o = {x: 1, y: 2}, o2 = {x: 3, y: 4};
+         function w(p, n) { var s = 0; for (var i = 0; i < n; i++) { s = (s + p.x) | 0; if (i === 7) p = o2; } return s; }
+         function c(p, n) { var s = p.y; for (var i = 0; i < n; i++) s = (s + p.x) | 0; return s; }
+         function cr(p, n, qs) { var s = 0; for (var i = 0; i < n; i++) { qs[i].a = i; s = (s + p.x) | 0; } return s; }
+         function sw(t, n) { var f = 0; for (var i = 0; i < n; i++) f = t.charAt; return f; }
+         function u(p, n) { var s = 0; for (var i = 0; i < n; i++) s = (s + p.x) | 0; return s; }
+         function fresh(n) { var a = []; for (var j = 0; j < n; j++) a.push({}); return a; }
+         for (var k = 0; k < 40; k++) { w(o, 20); c(o, 20); cr(o, 20, fresh(20)); sw('ab', 20); u(o, 20); }";
+    let graph = graph_after(source, "w");
+    assert!(shape_checks(&graph) > 0, "w\n{}", dump(&graph));
+    assert!(entry_shape_checks(&graph).is_empty(), "w\n{}", dump(&graph));
+    for name in ["cr", "sw"] {
+        let graph = graph_after(source, name);
+        assert!(
+            entry_shape_checks(&graph).is_empty(),
+            "{name}\n{}",
+            dump(&graph)
+        );
+    }
+    let graph = graph_after(source, "c");
+    assert_eq!(shape_checks(&graph), 0, "c\n{}", dump(&graph));
+    assert!(entry_shape_checks(&graph).is_empty(), "c\n{}", dump(&graph));
+    super::super::build::set_no_shape_hoist(true);
+    let graph = graph_after(source, "u");
+    super::super::build::set_no_shape_hoist(false);
+    assert!(shape_checks(&graph) > 0, "u unmoved\n{}", dump(&graph));
+    let graph = graph_after(source, "u");
+    assert_eq!(shape_checks(&graph), 0, "u\n{}", dump(&graph));
+}
+
+#[test]
+fn moved_shape_checks_read_as_the_vm_does() {
+    // Objects first checked in their loops, at graph against the tier off: a shape changed between
+    // runs of the loop (the entry's check fails, not the body's), a number or undefined where an
+    // object was, a receiver written on a path of the loop, `this` of methods called on objects of
+    // two shapes, an inlined method's receiver, a store, an update and a walk through the chain on
+    // the moved object, polymorphic sites, and a loop that never runs.
+    agrees_at_graph(
+        "function A() { this.v = 1; } A.prototype.k = 3;
+         function B() { this.w = 0; this.v = 2; } B.prototype.k = 4;
+         function M() { this.x = 1; this.y = 2; }
+         M.prototype.sum = function (n) { var s = 0; for (var i = 0; i < n; i++) s = (s + this.x + this.y) | 0; return s; };
+         function f(p, n) { var s = 0; for (var i = 0; i < n; i++) s = (s + p.x + p.y) | 0; return s; }
+         function g(p, n) { var s = 0; for (var i = 0; i < n; i++) { if ((i & 3) === 3) s = (s + p.x) | 0; } return s; }
+         function w(p, q, n) { var s = 0; for (var i = 0; i < n; i++) { s = (s + p.x) | 0; if (i === 4) p = q; } return s; }
+         function st(p, n) { var s = 0; for (var i = 0; i < n; i++) { p.x = i; p.y++; s = (s + p.x + p.y) | 0; } return s; }
+         function ch(p, n) { var s = 0; for (var i = 0; i < n; i++) s = (s + p.k + p.v) | 0; return s; }
+         function sum(q, n) { return q.sum(n); }
+         var r = 0;
+         for (var k = 0; k < 3000; k++) {
+             var o = (k % 5) ? {x: k & 7, y: 1} : {y: 1, x: 2};
+             var a = (k & 1) ? new A() : new B();
+             var q = (k % 7) ? o : (k % 11 ? 5 : undefined);
+             var m = new M(); if (k % 13 === 0) m.z = 1;
+             r = (r + f(o, 10) + g(q, (k % 7) ? 10 : 2) + w(o, {x: 9}, 10) + st({x: 1, y: 2}, 6)
+                  + ch(a, 8) + sum(m, 6) + f(o, 0)) % 1000003;
+         }
+         r",
+    );
+}
+
+/// `source`'s result and its exits, discards and compiles with the tier on (not eager) at the
+/// inlining mode `graph`, with the move (`moved`) or without it (the unmoved form).
+fn exits_discards_compiles(
+    source: &str,
+    graph: bool,
+    moved: bool,
+) -> (String, usize, usize, usize) {
+    let _quiet = epoch_quiet();
+    TestSwitches {
+        on: true,
+        inline_graph: Some(graph),
+        ..Default::default()
+    }
+    .set();
+    super::super::build::set_no_shape_hoist(!moved);
+    super::super::exit::TEST_EXITS.with(|exits| exits.borrow_mut().clear());
+    super::super::TEST_DISCARDED.with(|discarded| discarded.borrow_mut().clear());
+    super::super::TEST_COMPILED.with(|compiled| compiled.borrow_mut().clear());
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Jit);
+    let result = eval(&mut engine, source);
+    let counts = (
+        super::super::exit::TEST_EXITS.with(|exits| exits.borrow().len()),
+        super::super::TEST_DISCARDED.with(|discarded| discarded.borrow().len()),
+        super::super::TEST_COMPILED.with(|compiled| compiled.borrow().len()),
+    );
+    super::super::build::set_no_shape_hoist(false);
+    super::super::release_retired(&mut engine.interp);
+    (result, counts.0, counts.1, counts.2)
+}
+
+#[test]
+fn a_blind_moved_shape_check_costs_one_cycle() {
+    // loopfacts-impl/blind/b1.js's CheckShape form: p is read on a path the loop takes only in
+    // the warm-up runs (its check moves to the entry, a blind site); the later entries pass an
+    // object of another shape or a number and never take the path. The unmoved code never exits;
+    // the moved check fails at every entry until the exit limit's discard flags HoistingFailed
+    // at the header, whose recompile keeps the check in the loop: one cycle, one discard.
+    let source = "var o = {x: 3, y: 4};
+         function hot(p, n) {
+           var s = 0;
+           for (var i = 0; i < n; i++) { s = (s + i) | 0; if ((i & 255) === 255) s = (s + p.x) | 0; }
+           return s;
+         }
+         var t = 0;
+         for (var k = 0; k < 300; k++) t = (t + hot(o, 600)) | 0;
+         var other = {y: 1, x: 2};
+         for (var round = 0; round < 300; round++) {
+           for (var k = 0; k < 200; k++) t = (t + hot((round & 1) ? 7 : other, 50)) | 0;
+         }
+         t";
+    let expected = tier_off(source);
+    for graph in [false, true] {
+        let unmoved = exits_discards_compiles(source, graph, false);
+        let moved = exits_discards_compiles(source, graph, true);
+        assert_eq!(unmoved.0, expected, "graph {graph}: unmoved result");
+        assert_eq!(moved.0, expected, "graph {graph}: moved result");
+        assert_eq!(
+            (unmoved.1, unmoved.2, unmoved.3),
+            (0, 0, 1),
+            "graph {graph}: {unmoved:?}"
+        );
+        assert_eq!(
+            (moved.1, moved.2, moved.3),
+            (super::super::EXIT_LIMIT as usize, 1, 2),
+            "graph {graph}: one cycle, one discard: {moved:?}"
+        );
+    }
+}
+
+#[test]
+fn an_always_wrong_moved_shape_check_costs_what_the_sites_own_check_costs() {
+    // Every entry after the warm-up passes an object of a shape the sites' records never saw, read
+    // in the loop's condition (a site that runs whenever the loop is entered: the discard teaches
+    // it) and in the loop's body (blind: the discard flags the header): the moved check exits,
+    // discards and recompiles as often as the sites' own checks do in the unmoved code.
+    for (label, function) in [
+        (
+            "condition",
+            "function hot(p) { var s = 0; for (var i = 0; i < p.n; i++) s = (s + i) | 0; return s; }",
+        ),
+        (
+            "body",
+            "function hot(p) { var s = 0; for (var i = 0; i < 40; i++) s = (s + p.n) | 0; return s; }",
+        ),
+    ] {
+        let source = format!(
+            "{function}
+             var t = 0;
+             for (var k = 0; k < 300; k++) t = (t + hot({{n: 40}})) | 0;
+             for (var k = 0; k < 20000; k++) t = (t + hot({{m: k, n: 40}})) | 0;
+             t"
+        );
+        let expected = tier_off(&source);
+        for graph in [false, true] {
+            let unmoved = exits_discards_compiles(&source, graph, false);
+            let moved = exits_discards_compiles(&source, graph, true);
+            assert_eq!(unmoved.0, expected, "{label} graph {graph}: unmoved result");
+            assert_eq!(moved.0, expected, "{label} graph {graph}: moved result");
+            assert!(unmoved.1 > 0, "{label} graph {graph}: {unmoved:?}");
+            assert_eq!(
+                (moved.1, moved.2, moved.3),
+                (unmoved.1, unmoved.2, unmoved.3),
+                "{label} graph {graph}: exits, discards, compiles"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_effect_in_a_block_that_never_ran_leaves_the_loop_quiet() {
+    // The loop's only effect (a delete, a call the graph does not inline) is in a block that
+    // never ran, which the builder builds as its NeverRan exit: the loop keeps heap facts, p's
+    // first check moves to the entry, and the header keeps p's shape (Flow::new reads the blocks
+    // the builder builds, as JSC's LICM runs after ForceOSRExit made the rest of the block dead).
+    let source = "var o = {x: 1, y: 2};
+         function g(q) { return Object.keys(q).length; }
+         function f(p, n, k) { var s = 0; for (var i = 0; i < n; i++) { s = (s + p.x) | 0; if (k < i) { delete p.y; s = (s + g(p)) | 0; } } return s; }
+         for (var r = 0; r < 40; r++) f(o, 20, 100);";
+    let graph = graph_after(source, "f");
+    assert_eq!(shape_checks(&graph), 0, "{}", dump(&graph));
+    assert_eq!(entry_shape_checks(&graph).len(), 1, "{}", dump(&graph));
+    assert!(
+        graph.kept.iter().any(|kept| kept.shapes),
+        "{:?}",
+        graph.kept
+    );
+}
+
+#[test]
+fn a_block_that_never_ran_and_then_runs_reads_as_the_vm_does() {
+    // The never-ran block's effect changes the moved object's shape (a delete and a re-add, a
+    // prototype swap) once it runs: the compiled loop leaves at the block, the VM runs it.
+    agrees_at_graph(
+        "var P = {k: 3}, Q = {k: 9};
+         function g(q) { return Object.keys(q).length; }
+         function f(p, n, k) { var s = 0; for (var i = 0; i < n; i++) { s = (s + p.x + p.y) | 0; if (k < i) { delete p.x; p.x = 5; s = (s + g(p)) | 0; } } return s; }
+         function h(p, n, k) { var s = 0; for (var i = 0; i < n; i++) { s = (s + p.k) | 0; if (k < i) Object.setPrototypeOf(p, Q); } return s; }
+         var r = 0;
+         for (var j = 0; j < 3000; j++) {
+             var o = {x: j & 3, y: 1}, a = Object.create(P);
+             var k = j < 2000 ? 100 : (j % 7);
+             r = (r + f(o, 10, k) + h(a, 10, k)) % 1000003;
+         }
+         r",
+    );
 }

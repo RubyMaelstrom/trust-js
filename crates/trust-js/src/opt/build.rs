@@ -928,6 +928,55 @@ impl Rules<'_> {
         never_ran(self.snapshot, start, end) && !self.snapshot.declines(start, ExitReason::NeverRan)
     }
 
+    /// The receiver word of the named site at `pc` where it is a slot or the frame's `this`, and
+    /// the receiver shapes the site's own check takes, as the builder lowers it (`named_load`:
+    /// own data ways, else a walk through the chain, else the polymorphic arms; `named_store`,
+    /// `update_prop` and `append_prop`: own data ways), None for a string's walk (whose receiver no
+    /// CheckShape passes) (the quiet loop's facts, commit 2). None for any other operation, a
+    /// site with no such ways (a creation, an array's `length`, the generic access), and a
+    /// receiver of another source.
+    fn receiver_shapes(&self, pc: usize) -> Option<(Taken, Option<Vec<u32>>)> {
+        let (name, load) = match self.ops[pc] {
+            Op::GetProp(name, _)
+            | Op::GetMethod(name, _)
+            | Op::GetPropThis(name, _)
+            | Op::GetPropLocal(_, name, _) => (name, true),
+            Op::SetProp(name, _)
+            | Op::SetPropDrop(name, _)
+            | Op::SetPropThisDrop(name, _)
+            | Op::SetPropLocalDrop(_, name, _)
+            | Op::UpdateProp(name, _, _)
+            | Op::AppendProp(name, _) => (name, false),
+            _ => return None,
+        };
+        // The ways first, the receiver's word (a walk back through the block) last.
+        let shapes = if !load {
+            Some(self.own_data_ways(pc, name, true)?.shapes)
+        } else if !matches!(self.ops[pc], Op::GetMethod(..)) && self.array_length_site(pc, name) {
+            return None;
+        } else if let Some(ways) = self.own_data_ways(pc, name, false) {
+            Some(ways.shapes)
+        } else if let Some(chain) = self.chain_ways(pc, name) {
+            (!chain.string).then_some(chain.shapes)
+        } else {
+            Some(arm_shapes(&self.poly_ways(pc, name)?))
+        };
+        let slot = |below: usize| match self.receiver_source(pc, below)? {
+            Source::Slot(slot) => Some(Taken::Slot(slot)),
+            _ => None,
+        };
+        let word = match self.ops[pc] {
+            Op::GetPropThis(..) | Op::SetPropThisDrop(..) => Taken::This,
+            Op::GetPropLocal(local, ..) | Op::SetPropLocalDrop(local, ..) => {
+                Taken::Slot(local as usize)
+            }
+            Op::SetProp(..) | Op::SetPropDrop(..) => slot(1)?,
+            Op::AppendProp(..) => slot(2)?,
+            _ => slot(0)?,
+        };
+        Some((word, shapes))
+    }
+
     /// The source of the read at `pc` where it is a global-object property's or a script-level
     /// lexical's that the builder lowers (F4 part 1): its location or its binding.
     fn global_source(&self, pc: usize) -> Option<Source> {
@@ -1521,6 +1570,11 @@ struct Loop {
     /// Whether an operation of the loop reads its frame's `this`, for a loop that keeps heap
     /// facts: only then does its header keep the facts of `this` (`Builder::loop_object_facts`).
     reads_this: bool,
+    /// The objects the loop's named sites take that the loop does not write, each with the
+    /// receiver shapes its sites check and their pcs, for a loop that keeps heap facts and
+    /// creates nothing: its entry checks each shape once where no fact holds it
+    /// (`Builder::loop_entry_checks`; the quiet loop's facts, commit 2).
+    shaped: Vec<ShapedUse>,
     /// Whether an operation of the loop may be a canonical-frame effect ([`canonical`]), after
     /// which every slot is in the frame (P3 stage 3 step 3a: a generic node leaves the slots it
     /// does not write as they are, so step 0's rules, the load of an invariant slot and the notes
@@ -1605,6 +1659,27 @@ pub(crate) fn set_no_global_hoist(off: bool) {
     NO_GLOBAL_HOIST.with(|cell| cell.set(off));
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests: the unmoved form on this thread (no quiet loop's first shape check moved to its
+    /// entry: the quiet loop's facts, commit 2), the baseline of the blind and always-wrong tests.
+    static NO_SHAPE_HOIST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Tests: turn the move of a quiet loop's first shape checks to its entry off (or on again) for
+/// compiles on this thread.
+#[cfg(test)]
+#[cfg_attr(
+    not(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )),
+    allow(dead_code)
+)]
+pub(crate) fn set_no_shape_hoist(off: bool) {
+    NO_SHAPE_HOIST.with(|cell| cell.set(off));
+}
+
 /// A receiver an effect-free loop's element sites reach (P3 stage 3 step 0c): its source, the
 /// typed kind every one of its sites accesses in line (None where they differ, or a site takes
 /// the receiver in another form), whether one stores, and the sites' pcs (step L1c: the checks
@@ -1614,6 +1689,25 @@ struct TypedUse {
     source: Source,
     kind: Option<TypedKind>,
     write: bool,
+    pcs: Vec<u32>,
+}
+
+/// The receiver word of a quiet loop's named sites (the quiet loop's facts, commit 2): a slot the
+/// loop reads and does not write, or the frame's `this`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Taken {
+    Slot(usize),
+    This,
+}
+
+/// An object a quiet loop's named sites take (`Loop::shaped`): its word, the receiver shapes its
+/// sites check (their union, as each site's own check would take them: `Rules::receiver_shapes`;
+/// None where a site takes it as a string or the union passes four), and the sites' pcs (step
+/// L1c: the checks its entry check stands for).
+#[derive(Clone, Debug)]
+struct ShapedUse {
+    word: Taken,
+    shapes: Option<Vec<u32>>,
     pcs: Vec<u32>,
 }
 
@@ -1737,6 +1831,7 @@ impl Flow {
                 read_fields: Vec::new(),
                 creates: false,
                 reads_this: false,
+                shaped: Vec::new(),
                 stored_fields: Vec::new(),
                 canonical: false,
             };
@@ -1848,6 +1943,7 @@ impl Flow {
             // facts and the global reads' facts rest on them (its frames' came with their
             // summaries, `Rules::writes_at`).
             let (mut fields, mut creates) = (writes.fields, writes.creates);
+            let mut shaped: Vec<ShapedUse> = Vec::new();
             if found.keeps_heap {
                 for &index in &built {
                     let block = &blocks[ix(rpo[index])];
@@ -1866,6 +1962,44 @@ impl Flow {
                     }
                 }
             }
+            // The objects its named sites take that it does not write (commit 2), in a loop that
+            // keeps heap facts and creates nothing (whose header keeps no shape fact otherwise).
+            if found.keeps_heap && !creates {
+                for &index in &built {
+                    let block = &blocks[ix(rpo[index])];
+                    for pc in block.start..block.end {
+                        let Some((word, shapes)) = rules.receiver_shapes(pc) else {
+                            continue;
+                        };
+                        if matches!(word, Taken::Slot(slot) if found.written[slot]) {
+                            continue;
+                        }
+                        match shaped.iter_mut().find(|used| used.word == word) {
+                            Some(used) => {
+                                used.shapes = match (used.shapes.take(), shapes) {
+                                    (Some(mut union), Some(shapes)) => {
+                                        for shape in shapes {
+                                            if !union.contains(&shape) {
+                                                union.push(shape);
+                                            }
+                                        }
+                                        Some(union)
+                                    }
+                                    _ => None,
+                                };
+                                used.pcs.push(pc as u32);
+                            }
+                            None => shaped.push(ShapedUse {
+                                word,
+                                shapes,
+                                pcs: vec![pc as u32],
+                            }),
+                        }
+                    }
+                }
+            }
+            shaped.retain(|used| used.shapes.as_ref().is_some_and(|shapes| shapes.len() <= 4));
+            found.shaped = shaped;
             found.stored_fields = fields;
             found.creates = creates;
             if !found.read_fields.is_empty() {
@@ -2303,8 +2437,9 @@ struct CarriedFacts {
     creatable: crate::fasthash::FastSet<NodeIx>,
 }
 
-/// A check of a typed array made at a loop's entry edge (P3 stage 3 step 0c) and what it stands
-/// for (step L1c): its node, its own reason, the typed sites of its receiver in the loop, and the
+/// A check of a typed array made at a loop's entry edge (P3 stage 3 step 0c), or an object's
+/// first shape check made there (the quiet loop's facts, commit 2), and what it stands for (step
+/// L1c): its node, its own reason, the typed or named sites of its receiver in the loop, and the
 /// loop's header pc and frame, by which the selector finds the header block once the blocks are
 /// numbered (`phis::Selector::typed_entry_sites`).
 #[derive(Debug)]
@@ -2330,7 +2465,8 @@ pub(crate) struct PhiNotes {
     /// held at the header (P3 stage 3 step 3a) or loaded at the end of the predecessor where the
     /// frame kept them (`Builder::invariant`).
     pub(crate) invariants: Vec<(NodeIx, BlockIx)>,
-    /// The typed arrays' checks made at loops' entry edges (P3 stage 3 steps 0c and L1c).
+    /// The typed arrays' checks made at loops' entry edges (P3 stage 3 steps 0c and L1c), and the
+    /// objects' first shape checks made there (the quiet loop's facts, commit 2).
     pub(crate) typed_entry: Vec<TypedEntry>,
 }
 
@@ -3941,6 +4077,20 @@ impl<'a> Builder<'a> {
     /// exit kind, Ion's BailoutKind::LICM) leaves the checks in the loop. Nothing is made with two
     /// entry edges (no pre-header) or from a predecessor that ends in a branch.
     ///
+    /// Then the first shape check of each object the loop's named sites take that the loop does not
+    /// write (`Loop::shaped`: a slot it reads and does not write, the frame's `this`), in a loop that
+    /// creates nothing, where no fact of the edge holds its shape (the carry keeps one that does):
+    /// CheckShape of the shapes its sites check, exiting at the header's pc [HoistingFailed] and
+    /// standing for those sites [WrongShape], whose fact the header keeps (`loop_object_facts`), so
+    /// that the loop checks it no more (the quiet loop's facts, commit 2). That is Ion's LICM of
+    /// MGuardShape, movable and loading only ObjectFields, out of a loop that stores no shape
+    /// (jit/MIROps.yaml:2481-2493, jit/LICM.cpp:150-172, its bailout BailoutKind::LICM at :200 and
+    /// :241), and the DFG's of CheckStructure, which reads only JSCell_structureID
+    /// (dfg/DFGClobberize.h:1511-1513; dfg/DFGLICMPhase.cpp:252-269, a blind hoist barred where its
+    /// node's HoistingFailed exit site is set, :254, :411). A blind site's failure flags the
+    /// header, a site that runs whenever the loop is entered learns from it
+    /// (`driver::flag_moved`).
+    ///
     /// The loop's global reads (F4 part 1) go first: each read's own nodes, its identity, epoch or
     /// generation checks keeping the read's reason [WrongName] and standing for that read alone,
     /// which learns from their exit as from its own check (its flag with the proof the check
@@ -3970,7 +4120,18 @@ impl<'a> Builder<'a> {
                 ExitReason::HoistingFailed,
                 "the typed arrays' checks in the loop",
             );
-        if !globals && !typed_checks {
+        #[cfg(test)]
+        let unmoved = NO_SHAPE_HOIST.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let unmoved = false;
+        let shape_checks = !unmoved
+            && !lp.shaped.is_empty()
+            && !self.declined(
+                pc,
+                ExitReason::HoistingFailed,
+                "the shape checks in the loop",
+            );
+        if !globals && !typed_checks && !shape_checks {
             return;
         }
         let state = self.frame_state(pc, st);
@@ -4047,6 +4208,37 @@ impl<'a> Builder<'a> {
             self.elements_kind(st, &mut cx, word, cell, ElemKind::Typed(Some(kind)));
             let (view, _) = self.typed_view(st, word, cell, pc);
             self.typed_data(st, &mut cx, cell, view, typed.write);
+        }
+        // The first shape check of each object the loop's named sites take (the quiet loop's
+        // facts, commit 2), where no fact of the entry holds its shape (the carry keeps one that
+        // does), with the shapes its sites check: the header keeps the fact
+        // (`loop_object_facts`), and the sites check no more.
+        let shaped_uses: &[ShapedUse] = if shape_checks { &lp.shaped } else { &[] };
+        for used in shaped_uses {
+            let Some(shapes) = &used.shapes else {
+                continue;
+            };
+            let word = match used.word {
+                Taken::Slot(slot) => match slots[slot] {
+                    Slot::Clean(value) | Slot::Dirty(value) => value,
+                    Slot::Entry => {
+                        let value = self.hoist(Hoisted::Entry(slot as u16));
+                        slots[slot] = Slot::Clean(value);
+                        value
+                    }
+                    Slot::Frame | Slot::Dead => continue,
+                },
+                Taken::This => self.this(),
+            };
+            if st.shapes.contains_key(&word)
+                || self.rep(word) != Rep::Tagged
+                || self.constant(word).is_some()
+            {
+                continue;
+            }
+            stands.push((self.graph.block(pred).body.len(), &used.pcs));
+            let mut cx = Before::with(pc, state);
+            self.shaped(st, &mut cx, word, shapes);
         }
         self.cur = cur;
         // The nodes made go before the predecessor's terminator, their exits the entry's.
