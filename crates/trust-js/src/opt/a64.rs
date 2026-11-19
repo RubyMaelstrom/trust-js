@@ -654,6 +654,7 @@ fn check_graph(
                     ));
                 }
                 NodeOp::CheckShape { ref shapes, .. }
+                | NodeOp::CheckTypedShape { ref shapes, .. }
                 | NodeOp::CheckProto { ref shapes, .. }
                 | NodeOp::CheckStringProto { ref shapes, .. }
                 | NodeOp::ShapeIs(ref shapes)
@@ -941,6 +942,16 @@ const SAVE_CHECK_THIS: u32 = 40;
 
 /// Out-of-line code, emitted after the body.
 enum Cold {
+    /// TypedArrayLength's view with no guard record or a count at the record's clamp (the getter
+    /// line, (c)): `typed_getter(ctx, receiver, which)`, the Number's word into `dst`.
+    TypedGetter {
+        label: usize,
+        node: NodeIx,
+        receiver: NodeIx,
+        which: u8,
+        dst: u32,
+        resume: usize,
+    },
     /// The book of a StoreTyped whose buffer an embedder observed (P3 stage 3 step L4): X17 the
     /// buffer's record, X9 the zero-extended index, `view` the view's register; the interval
     /// and the count, as `emit_dirty` keeps them.
@@ -1593,6 +1604,41 @@ unsafe extern "C" fn to_boolean(ctx: *mut JitCtx, word: u64) -> u64 {
     u64::from(i.to_boolean(&unsafe { crate::value::Value::from_bits(word) }))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// TypedArrayLength's out-of-line calls (`typed_getter`).
+    pub(crate) static TEST_TYPED_GETTER_CALLS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+/// TypedArrayLength's cold path (the getter line, (c)): the intrinsic %TypedArray.prototype%
+/// getter `which` (0 `length`, 1 `byteLength`, 2 `byteOffset`) called with the typed-array
+/// receiver `word`, for a view with no guard record (BigInt or Float16 elements, a shared buffer)
+/// or a count at the record's clamp. For a typed-array receiver it runs no JavaScript, allocates
+/// nothing and does not collect: its answer is a Number, whose word this returns.
+unsafe extern "C" fn typed_getter(ctx: *mut JitCtx, word: u64, which: u64) -> u64 {
+    use crate::builtins::TaAccessor;
+    #[cfg(test)]
+    TEST_TYPED_GETTER_CALLS.with(|calls| calls.set(calls.get() + 1));
+    let i = unsafe { &mut *(*ctx).interp };
+    let accessor = match which {
+        0 => TaAccessor::Length,
+        1 => TaAccessor::ByteLength,
+        _ => TaAccessor::ByteOffset,
+    };
+    let getter = crate::builtins::ta_accessor_getters()
+        .iter()
+        .find(|(each, _)| *each == accessor)
+        .map(|&(_, getter)| getter)
+        .expect("an intrinsic getter");
+    let receiver = unsafe { crate::value::Value::from_bits(word) };
+    match getter(i, receiver, &[]) {
+        Ok(value) => value.bits(),
+        Err(_) => crate::value::Value::Num(0.0).bits(),
+    }
+}
+
 /// NullOrLikeUndefined's cold path (P3 stage 3 step L1): whether the object `word`, whose
 /// ic_plain is clear, is the [[IsHTMLDDA]] object. It runs no JavaScript, allocates nothing and
 /// does not collect.
@@ -1740,6 +1786,7 @@ fn default_reason(op: &NodeOp) -> ExitReason {
         NodeOp::CheckInt32 => ExitReason::NotInt32,
         NodeOp::CheckObject => ExitReason::NotObject,
         NodeOp::CheckShape { .. }
+        | NodeOp::CheckTypedShape { .. }
         | NodeOp::CheckProto { .. }
         | NodeOp::CheckStringProto { .. }
         | NodeOp::CheckCreatable { .. }
@@ -1749,7 +1796,7 @@ fn default_reason(op: &NodeOp) -> ExitReason {
         | NodeOp::StoreNew { .. }
         | NodeOp::StringLength => ExitReason::WrongShape,
         NodeOp::CheckBoolean => ExitReason::NotBoolean,
-        NodeOp::CheckCallee { .. } => ExitReason::WrongCallee,
+        NodeOp::CheckCallee { .. } | NodeOp::CheckGetter { .. } => ExitReason::WrongCallee,
         NodeOp::CheckInitialized => ExitReason::Tdz,
         NodeOp::CheckString => ExitReason::NotString,
         NodeOp::CheckObjectOrNullish => ExitReason::NotObjectOrNullish,
@@ -2659,6 +2706,78 @@ impl Gen<'_> {
                 );
                 self.shape_compare(X17, shapes, site);
                 self.gp_done(n, cell);
+            }
+            NodeOp::CheckTypedShape {
+                shapes,
+                ways,
+                object,
+            } => {
+                let site = self.check_exit(n)?;
+                let pc = graph.state(node.state.expect("checked")).pc;
+                let receiver = self.source(input(0), pc)?;
+                if let Some((_, _, record)) = self.exits.last_mut() {
+                    record.shape_check = Some(Box::new(crate::opt::exit::ShapeCheck {
+                        receiver,
+                        shapes: shapes.clone().into(),
+                        ways: *ways,
+                        hop: false,
+                    }));
+                }
+                let word = self.gp(input(0), X16);
+                if !*object {
+                    let t = if word == X16 { X17 } else { X16 };
+                    self.a.asr_imm(t, word, 48);
+                    self.a.cmn_imm_x(t, 7);
+                    self.a.b_cond(NE, site);
+                }
+                let cell = self.gp_dst(n);
+                self.a.ubfx(cell, word, 0, 48);
+                // As the template's typed-array way (piece a1, `emit_prop_way_probe`'s typed
+                // path): the kind tag a typed array's, then the shape.
+                let layout = self.layout;
+                let obj = layout.obj_from_cell;
+                self.a.ldrb_imm(X17, cell, (obj + layout.obj_kind) as u32);
+                self.a
+                    .cmp_imm_w(X17, crate::value::KIND_TYPED_ARRAY_TAG as u32);
+                self.a.b_cond(NE, site);
+                self.a.ldr_w_imm(
+                    X17,
+                    cell,
+                    (obj + layout.obj_props + layout.props_shape) as u32,
+                );
+                self.shape_compare(X17, shapes, site);
+                self.gp_done(n, cell);
+            }
+            NodeOp::CheckGetter { native } => {
+                let site = self.check_exit(n)?;
+                let word = self.gp(input(0), X16);
+                // As the template's shared stub (jit_typed_array.rs emit_named_getter): the
+                // pair (PACK_ACCESSOR's payload), its live [[Get]] word, an object's, whose kind
+                // payload is a Native's function: no other kind's payload is a function of the
+                // binary's text, so the identity compare needs no kind test.
+                self.a.ubfx(X17, word, 0, 48);
+                self.a.cbz(X17, true, site);
+                self.a
+                    .ldr_imm(X17, X17, crate::value::ACCESSOR_GET_WORD_OFF as u32);
+                self.a.lsr_imm(X9, X17, 48);
+                self.a.movz(X16, (crate::value::PACK_OBJ >> 48) as u32, 0);
+                self.a.cmp_reg_w(X9, X16);
+                self.a.b_cond(NE, site);
+                self.a.ubfx(X17, X17, 0, 48);
+                let layout = self.layout;
+                self.a.ldr_imm(
+                    X17,
+                    X17,
+                    (layout.obj_from_cell + layout.obj_kind + 8) as u32,
+                );
+                self.a.mov_imm64(X9, *native);
+                self.a.cmp_reg_x(X17, X9);
+                self.a.b_cond(NE, site);
+            }
+            NodeOp::TypedArrayLength { which } => {
+                if !unused {
+                    self.lower_typed_array_length(n, *which)?;
+                }
             }
             NodeOp::CheckProto { shapes, ways } => {
                 let site = self.check_exit(n)?;
@@ -4676,6 +4795,29 @@ impl Gen<'_> {
                         resume,
                         throw,
                     } => self.emit_poll_slow(label, node, resume, throw),
+                    Cold::TypedGetter {
+                        label,
+                        node,
+                        receiver,
+                        which,
+                        dst,
+                        resume,
+                    } => {
+                        self.a.bind(label);
+                        // The receiver's word before the frame moves (a spilled one's slot).
+                        let word = self.gp(receiver, X16);
+                        let saved = self.save_live_caller_saved(node);
+                        // The word first: it may be in x0.
+                        self.a.mov(1, word);
+                        self.a.mov(0, 19);
+                        self.a.movz(2, u32::from(which), 0);
+                        self.a.mov_imm64(X16, typed_getter as *const () as u64);
+                        self.a.blr(X16);
+                        self.a.fmov_d_x(D30, 0);
+                        self.restore_live_caller_saved(&saved);
+                        self.a.fmov_d_d(dst, D30);
+                        self.a.b(resume);
+                    }
                     Cold::ToBoolean {
                         label,
                         node,
@@ -5389,6 +5531,88 @@ impl Gen<'_> {
 /// Element accesses (P3 stage 2 step 2): Maglev's element nodes on TRust's element words (ir.rs).
 impl Gen<'_> {
     /// The typed arrays' native layout, which the typed nodes read through.
+    /// TypedArrayLength (the getter line, (c)): the answer as the template's shared stub computes
+    /// it (jit_typed_array.rs emit_named_getter), from the view (X9) and its buffer: 0 for a
+    /// detached buffer or a view out of bounds, a fixed view's count (shifted for `byteLength`,
+    /// its offset for `byteOffset`), a length-tracking view's from the live byte length; a view
+    /// with no guard record or a count at the clamp takes the cold call of the intrinsic
+    /// (`typed_getter`). X9, X16 and X17 are the scratch registers; the count is converted
+    /// into the node's F64 home.
+    fn lower_typed_array_length(&mut self, n: NodeIx, which: u8) -> Result<(), Refusal> {
+        use crate::native_typed_array::{NativeBuffer as Buffer, NativeTypedArray as View};
+        use std::mem::offset_of;
+        let native = self.native()?;
+        let inputs = &self.graph.node(n).inputs;
+        let (view_in, receiver) = (inputs[0], inputs[1]);
+        let view = self.gp(view_in, X16);
+        self.a.mov(X9, view);
+        let tracking = self.a.new_label();
+        let zero = self.a.new_label();
+        let number = self.a.new_label();
+        let slow = self.a.new_label();
+        let resume = self.a.new_label();
+        self.a.ldr_imm(X16, X9, offset_of!(View, buffer_ptr) as u32);
+        self.a.cbz(X16, true, slow);
+        self.a
+            .ldrb_imm(X17, X16, offset_of!(Buffer, attached) as u32);
+        self.a.cbz(X17, false, zero);
+        self.a
+            .ldr_imm(X16, X16, offset_of!(Buffer, storage_ptr) as u32);
+        // X16 = the buffer's byte length (its bytes' `Vec` length, read without a borrow);
+        // X17 = the view's end (usize::MAX: a length-tracking view).
+        self.a
+            .ldr_imm(X16, X16, (native.refcell_value + native.vec_len) as u32);
+        self.a.ldr_imm(X17, X9, offset_of!(View, end) as u32);
+        self.a.cmn_imm_x(X17, 1);
+        self.a.b_cond(EQ, tracking);
+        self.a.cmp_reg_x(X16, X17);
+        self.a.b_cond(LO, zero); // a fixed view out of bounds is wholly so
+        if which == 2 {
+            self.a.ldr_imm(X16, X9, offset_of!(View, offset) as u32);
+        } else {
+            self.a.ldr_imm(X16, X9, offset_of!(View, limit) as u32);
+            self.a.movz(X17, 0x8000, 1); // 1 << 31: the record's clamp of the count
+            self.a.cmp_reg_x(X16, X17);
+            self.a.b_cond(HS, slow);
+            if which == 1 {
+                self.a.ldrb_imm(X17, X9, offset_of!(View, shift) as u32);
+                self.a.lsl_reg(X16, X16, X17);
+            }
+        }
+        self.a.b(number);
+        self.a.bind(tracking);
+        self.a.ldr_imm(X17, X9, offset_of!(View, offset) as u32);
+        self.a.cmp_reg_x(X16, X17);
+        self.a.b_cond(LO, zero);
+        if which == 2 {
+            self.a.mov(X16, X17);
+        } else {
+            self.a.sub_reg(X16, X16, X17);
+            self.a.ldrb_imm(X17, X9, offset_of!(View, shift) as u32);
+            self.a.lsr_reg(X16, X16, X17);
+            if which == 1 {
+                self.a.lsl_reg(X16, X16, X17);
+            }
+        }
+        self.a.b(number);
+        self.a.bind(zero);
+        self.a.movz(X16, 0, 0);
+        self.a.bind(number);
+        let dst = self.fp_dst(n);
+        self.a.scvtf_d_x(dst, X16);
+        self.a.bind(resume);
+        self.cold.push(Cold::TypedGetter {
+            label: slow,
+            node: n,
+            receiver,
+            which,
+            dst,
+            resume,
+        });
+        self.fp_done(n, dst);
+        Ok(())
+    }
+
     fn native(&self) -> Result<crate::native_typed_array::Layout, Refusal> {
         self.layout
             .native_typed_array

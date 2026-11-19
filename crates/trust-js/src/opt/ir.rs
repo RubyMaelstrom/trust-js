@@ -439,6 +439,19 @@ pub(crate) enum NodeOp {
         ways: u8,
         object: bool,
     },
+    /// Tagged -> Cell: a typed array whose shape is one of these (at most four): CheckShape's
+    /// form for a read whose ways recorded a typed-array receiver (the getter line, (c); piece a1's
+    /// receiver kind 4), whose receiver test is the kind tag's in place of the IC-plain flag's,
+    /// which a typed array has clear (TRust's shapes are layouts every kind shares, so the kind
+    /// is tested as V8's map, SpiderMonkey's GuardClass and JSC's structure name the class); else
+    /// an exit [WrongShape], whose teacher is the ways' kind (a site that met another receiver
+    /// holds a way of another kind). `ways` and `object` as CheckShape's. It lends no shape fact:
+    /// an ordinary read's CheckShape of the word stays.
+    CheckTypedShape {
+        shapes: Vec<u32>,
+        ways: u8,
+        object: bool,
+    },
     /// Cell -> Cell: the input object's [[Prototype]] (its `proto` field, which no shape
     /// implies), where it is an object of an ordinary kind with IC_PLAIN set and one of
     /// `shapes` (at most four), as the templates' hop checks it (jit.rs emit_baked); else an
@@ -705,6 +718,29 @@ pub(crate) enum NodeOp {
     /// a value fact (Maglev's LoadTypedArrayLength of a fixed-length array). At most 2^31, which
     /// only the unsigned bounds check reads.
     TypedLength,
+    /// Tagged -> None: a holder slot's accessor word (its LoadField's) whose pair's live [[Get]]
+    /// is the native function `native` (its address, the binary's text: an intrinsic's of any
+    /// Realm), else an exit [WrongCallee] (the getter line, (c)), as JSC's inline cache compares
+    /// the live getter with the intrinsic (bytecode/InlineCacheCompiler.cpp:3463-3467) and Warp
+    /// keeps the baseline stub's GuardSpecificFunction. Its teacher is the snapshot's reading of
+    /// the live getter (`Snapshot::typed_getter`). It reads the pair, which only a redefinition
+    /// (an effect) replaces.
+    CheckGetter {
+        native: u64,
+    },
+    /// (Ptr view, Tagged receiver) -> F64: the answer of the intrinsic %TypedArray.prototype%
+    /// getter `which` (0 `length`, 1 `byteLength`, 2 `byteOffset`) for a typed-array receiver
+    /// and its view (the getter line, (c)): computed as the template's shared stub does
+    /// (jit_typed_array.rs emit_named_getter), 0 for a detached buffer or a view out of bounds
+    /// with no exit, as TurboFan selects 0 on the detached bit (compiler/js-call-reducer.cc:
+    /// 8784-8792); a view with no guard record (BigInt or Float16 elements, a shared buffer) or a
+    /// count at the record's clamp calls the intrinsic out of line with the receiver, which runs
+    /// no JavaScript and allocates nothing for a typed-array receiver. A heap read of the effect
+    /// epoch: it reads the buffer's live byte length and attached byte, which only Rust changes
+    /// (resize, detach, transfer: calls, i.e. effects), so no value fact.
+    TypedArrayLength {
+        which: u8,
+    },
     /// (Cell, Ptr view) -> Ptr: the elements' address, the buffer's bytes plus the view's offset,
     /// with the buffer attached, writable for a store, unborrowed by Rust and reaching the view's
     /// end [Detached] (Maglev's CheckTypedArrayValid, TRust having no detaching protector; the
@@ -935,6 +971,8 @@ impl NodeOp {
                 | NodeOp::TruncateNumberOrOddball
                 | NodeOp::CheckObject
                 | NodeOp::CheckShape { .. }
+                | NodeOp::CheckTypedShape { .. }
+                | NodeOp::CheckGetter { .. }
                 | NodeOp::CheckProto { .. }
                 | NodeOp::CheckStringProto { .. }
                 | NodeOp::CheckCreatable { .. }

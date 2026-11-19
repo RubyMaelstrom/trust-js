@@ -85,6 +85,10 @@ pub(crate) struct Snapshot {
     chains: Box<[(u32, Box<[CreationChain]>)]>,
     /// The InstanceOf sites' cells (see [`InstanceOfView`]), by pc, ascending.
     instance_ofs: Box<[(u32, InstanceOfView)]>,
+    /// The intrinsic typed-array getter each named read of `length`, `byteLength` or
+    /// `byteOffset` reaches through its typed-array accessor ways, by pc, ascending (see
+    /// [`Snapshot::typed_getter`]); empty where the snapshot read no realm.
+    typed_getters: Box<[(u32, crate::builtins::TaAccessor)]>,
     /// An embedder had observed some buffer of the realm's Agent (the protector, see
     /// [`Snapshot::buffers_observed`]).
     buffers_observed: bool,
@@ -358,6 +362,8 @@ pub(crate) struct Raw {
     chains: Vec<(u32, Box<[CreationChain]>)>,
     /// The InstanceOf sites' cells (see [`InstanceOfView`]).
     instance_ofs: Vec<(u32, InstanceOfView)>,
+    /// The reads' intrinsic typed-array getters (see [`Snapshot::typed_getter`]).
+    typed_getters: Vec<(u32, crate::builtins::TaAccessor)>,
     /// An embedder had observed some buffer of the realm's Agent (`BufferLedger::any_observed`,
     /// P3 stage 3 step L4): the protector read on the main thread.
     buffers_observed: bool,
@@ -400,10 +406,14 @@ impl Raw {
             realm.is_some_and(|realm| realm.gc_heap.agent.buffer_ledger.any_observed());
         instance_ofs(chunk, ops, &mut self.instance_ofs);
         self.chains.clear();
+        self.typed_getters.clear();
         if let Some(realm) = realm {
             for (pc, op) in ops.iter().enumerate() {
                 if let Some(chains) = creation_chains(chunk, pc, op, realm) {
                     self.chains.push((pc as u32, chains));
+                }
+                if let Some(which) = typed_getter(chunk, pc, op, realm) {
+                    self.typed_getters.push((pc as u32, which));
                 }
             }
         }
@@ -574,8 +584,23 @@ impl Snapshot {
             names: names.into_boxed_slice(),
             chains: raw.chains.clone().into_boxed_slice(),
             instance_ofs: raw.instance_ofs.clone().into_boxed_slice(),
+            typed_getters: raw.typed_getters.clone().into_boxed_slice(),
             buffers_observed: raw.buffers_observed,
         }
+    }
+
+    /// The intrinsic %TypedArray.prototype% getter (`length`, `byteLength` or `byteOffset`, of
+    /// the read's own name) that the named read at `pc` reached through its typed-array accessor
+    /// ways when the snapshot was taken, read from the live holder (see `typed_getter` below):
+    /// the input of the typed-array length node (the getter line, (c); `Builder::typed_getter_load`),
+    /// whose live getter check a replaced getter fails, which the next compile reads here, as
+    /// TurboFan reads the holder's accessor constant (compiler/access-info.cc) and Warp the
+    /// baseline stub's GuardSpecificFunction. None for any other site.
+    pub(crate) fn typed_getter(&self, pc: usize) -> Option<crate::builtins::TaAccessor> {
+        self.typed_getters
+            .binary_search_by_key(&(pc as u32), |&(at, _)| at)
+            .ok()
+            .map(|at| self.typed_getters[at].1)
     }
 
     /// Whether an embedder had observed some buffer of the Agent when the snapshot was taken (P3
@@ -843,6 +868,49 @@ fn with_baseline_records(own: SiteView, baseline: SiteView) -> SiteView {
         }
         (own, _) => own,
     }
+}
+
+/// The intrinsic getter a named read `op` at `pc` of `length`, `byteLength` or `byteOffset`
+/// reaches through its typed-array accessor ways (piece a1's ways of receiver kind 4; main
+/// thread): %TypedArray.prototype%, the [[Prototype]] of the realm's intrinsic
+/// Uint8Array.prototype, with the way's holder shape, whose slot holds an accessor whose live
+/// getter is that name's intrinsic (`builtins::ta_accessor_of`, of any Realm). A word read for
+/// the compile alone: the code checks the live getter itself (CheckGetter).
+fn typed_getter(
+    chunk: &Chunk,
+    pc: usize,
+    op: &Op,
+    realm: &Interp,
+) -> Option<crate::builtins::TaAccessor> {
+    use crate::builtins::TaAccessor;
+    let (Op::GetProp(name, _) | Op::GetPropThis(name, _) | Op::GetPropLocal(_, name, _)) = *op
+    else {
+        return None;
+    };
+    let which = match chunk.jit_name(name) {
+        "length" => TaAccessor::Length,
+        "byteLength" => TaAccessor::ByteLength,
+        "byteOffset" => TaAccessor::ByteOffset,
+        _ => return None,
+    };
+    let SiteView::Named(named) = chunk.feedback_view(pc) else {
+        return None;
+    };
+    let way = named.filled().find(|way| {
+        way.kind == crate::feedback::NamedWayKind::Accessor
+            && way.primitive == crate::bytecode::IC_RECEIVER_TYPED_ARRAY
+    })?;
+    let concrete = realm.extra_protos.get("Uint8Array")?;
+    let holder = concrete.try_borrow().ok()?.proto?;
+    let holder = holder.try_borrow().ok()?;
+    if holder.props.shape() != way.holder_shape {
+        return None;
+    }
+    let property = holder.props.property_at(way.slot as usize)?;
+    if !property.accessor() {
+        return None;
+    }
+    (crate::builtins::ta_accessor_of(property.getter()?) == Some(which)).then_some(which)
 }
 
 /// The chains of the creation ways of `chunk`'s named store `op` at `pc` (main thread; see

@@ -681,6 +681,72 @@ impl Rules<'_> {
         chain
     }
 
+    /// A named read of a typed array's `length`, `byteLength` or `byteOffset` (the getter line,
+    /// (c)): every way an accessor way of piece a1's typed-array receiver (kind 4) at depth 1 to
+    /// 3, each level between with its recorded shape, every shape cacheable, the slot in a
+    /// cache's reach, which share one walk (the levels' shapes, the holder's location and slot)
+    /// and differ at most in the receiver's shape (up to four), as `chain_ways` requires of data
+    /// ways; and the snapshot read the holder slot's live getter as the name's intrinsic
+    /// (`Snapshot::typed_getter`, the input a replaced getter changes). None where the site took
+    /// another receiver (a way of another kind: the receiver check's teacher), a generic mark or
+    /// another getter.
+    fn typed_accessor_ways(
+        &self,
+        pc: usize,
+        name: u32,
+    ) -> Option<(Chain, crate::builtins::TaAccessor)> {
+        let which = self.snapshot.typed_getter(pc)?;
+        if self.chunk.jit_name(name) != which.name() {
+            return None;
+        }
+        let named = self.snapshot.named(pc)?;
+        if named.generic {
+            return None;
+        }
+        let mut chain: Option<Chain> = None;
+        for way in named.filled() {
+            if way.kind != NamedWayKind::Accessor
+                || way.primitive != crate::bytecode::IC_RECEIVER_TYPED_ARRAY
+                || way.depth == 0
+                || way.location == 0
+                || way.slot >= MAX_FIELD_SLOT
+                || !crate::value::is_cacheable_shape(way.receiver_shape)
+            {
+                return None;
+            }
+            let levels = way.levels()?;
+            if !levels
+                .iter()
+                .all(|&shape| crate::value::is_cacheable_shape(shape))
+            {
+                return None;
+            }
+            match &mut chain {
+                None => {
+                    chain = Some(Chain {
+                        string: false,
+                        shapes: vec![way.receiver_shape],
+                        levels,
+                        location: way.location,
+                        slot: way.slot,
+                    })
+                }
+                Some(chain) => {
+                    if chain.levels != levels
+                        || chain.location != way.location
+                        || chain.slot != way.slot
+                    {
+                        return None;
+                    }
+                    if !chain.shapes.contains(&way.receiver_shape) {
+                        chain.shapes.push(way.receiver_shape);
+                    }
+                }
+            }
+        }
+        Some((chain?, which))
+    }
+
     /// Whether the named load of `name` at `pc` lowers (the builder's `named_load`): on own data
     /// ways, through the prototype chain, or by the receiver's shape to several walks (P3 stage 3
     /// step L2), where no WrongShape flag of the site's ways declines it, so that a loop whose
@@ -689,6 +755,10 @@ impl Rules<'_> {
     fn named_load_lowers(&self, pc: usize, name: u32) -> bool {
         if let Some(ways) = self.own_data_ways(pc, name, false) {
             return !self.stale_ways(pc, &ways);
+        }
+        if let Some((chain, _)) = self.typed_accessor_ways(pc, name) {
+            return !self.stale_shapes(pc, &chain.shapes)
+                && !self.snapshot.declines(pc, ExitReason::WrongCallee);
         }
         if let Some(chain) = self.chain_ways(pc, name) {
             return !self.stale_shapes(pc, &chain.shapes);
@@ -5621,6 +5691,14 @@ impl<'a> Builder<'a> {
         st: &mut State,
     ) -> Result<(), Refusal> {
         let Some(ways) = self.own_data_ways(pc, name, false) else {
+            if let Some((chain, which)) = self.rules().typed_accessor_ways(pc, name) {
+                if self.shapes_declined(pc, &chain.shapes)
+                    || self.declined(pc, ExitReason::WrongCallee, "the generic access")
+                {
+                    return self.effect(pc, st);
+                }
+                return self.typed_getter_load(pc, recv, method, &chain, which, st);
+            }
             if let Some(chain) = self.rules().chain_ways(pc, name) {
                 if self.shapes_declined(pc, &chain.shapes) {
                     return self.effect(pc, st);
@@ -5845,6 +5923,94 @@ impl<'a> Builder<'a> {
     /// the templates' probe walks it (jit.rs emit_baked), SpiderMonkey's LoadProto and GuardShape
     /// (jit/CacheIR.cpp ShapeGuardProtoChainForCrossCompartmentHolder, 891-909) and JSC's
     /// poly-proto chain (bytecode/InlineCacheCompiler.cpp 1866-1915).
+    /// A read of a typed array's `length`, `byteLength` or `byteOffset` through its intrinsic
+    /// getter (the getter line, (c); `Rules::typed_accessor_ways`): the receiver a typed array
+    /// of the ways' shapes [WrongShape], each level of the walk checked [WrongShape], the holder
+    /// slot's live getter the intrinsic [WrongCallee], then the answer from the receiver's view
+    /// (`NodeOp::TypedArrayLength`), with no call: as TurboFan reduces the intrinsic getter's
+    /// call to the view's length with the detached case selected to 0
+    /// (compiler/js-call-reducer.cc:8749-8800, 8637-8748), SpiderMonkey's Warp transpiles the baseline's
+    /// LoadArrayBufferViewLength behind the getter's guard (jit/CacheIR.cpp:11917-11957) and
+    /// JSC's DFG makes GetArrayLength of a typed array. The checks lend no facts: an ordinary
+    /// read of the word keeps its own.
+    fn typed_getter_load(
+        &mut self,
+        pc: usize,
+        recv: Recv,
+        method: bool,
+        chain: &Chain,
+        which: crate::builtins::TaAccessor,
+        st: &mut State,
+    ) -> Result<(), Refusal> {
+        use crate::builtins::TaAccessor;
+        let receiver = self.receiver(recv, st, 0, pc);
+        let mut cx = Before::new(pc);
+        let word = self.tagged(st, receiver, pc);
+        let ways = u8::try_from(chain.shapes.len()).expect("at most four ways");
+        let object = self.forms(st, word).object;
+        let state = self.before(&mut cx, st);
+        let cell = self.add_exit(
+            NodeOp::CheckTypedShape {
+                shapes: chain.shapes.clone(),
+                ways,
+                object,
+            },
+            &[word],
+            Rep::Cell,
+            pc,
+            state,
+            ExitReason::WrongShape,
+        );
+        let mut object = word;
+        let mut holder = cell;
+        for &shape in &chain.levels {
+            holder = self.prototype(st, &mut cx, object, holder, shape, ways);
+            object = holder;
+        }
+        // The holder slot's accessor word, for the getter's check alone (no field fact: it is
+        // no value).
+        let accessor = self.add(
+            NodeOp::LoadField {
+                location: chain.location,
+                slot: chain.slot,
+            },
+            &[holder],
+            Rep::Tagged,
+            pc,
+        );
+        let native = crate::builtins::ta_accessor_getters()
+            .iter()
+            .find(|(each, _)| *each == which)
+            .map(|&(_, getter)| getter as usize as u64)
+            .expect("an intrinsic getter");
+        let state = self.before(&mut cx, st);
+        self.add_exit(
+            NodeOp::CheckGetter { native },
+            &[accessor],
+            Rep::None,
+            pc,
+            state,
+            ExitReason::WrongCallee,
+        );
+        let view = self.add(NodeOp::TypedView, &[cell], Rep::Ptr, pc);
+        let which = match which {
+            TaAccessor::Length => 0,
+            TaAccessor::ByteLength => 1,
+            _ => 2,
+        };
+        let value = self.add(
+            NodeOp::TypedArrayLength { which },
+            &[view, word],
+            Rep::F64,
+            pc,
+        );
+        if matches!(recv, Recv::Stack) && !method {
+            st.stack.pop();
+        }
+        st.stack.push(value);
+        Ok(())
+    }
+
     fn chain_load(
         &mut self,
         pc: usize,

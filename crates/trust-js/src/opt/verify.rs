@@ -677,6 +677,11 @@ fn heap_write(op: &NodeOp) -> HeapWrite {
         | NodeOp::F64Mod
         | NodeOp::Poll
         | NodeOp::Exit { .. }
+        // The typed-array length node's out-of-line call runs the intrinsic getter, which runs
+        // no JavaScript and writes nothing for a typed-array receiver (the getter line, (c)).
+        | NodeOp::TypedArrayLength { .. }
+        | NodeOp::CheckTypedShape { .. }
+        | NodeOp::CheckGetter { .. }
         // Constants, reads, checks, arithmetic and control flow write nothing.
         | NodeOp::ConstTagged { .. }
         | NodeOp::ConstF64 { .. }
@@ -1173,6 +1178,9 @@ fn signature(op: &NodeOp) -> Option<(&'static [Rep], Rep)> {
         NodeOp::StringLength => (TAGGED, Rep::I32),
         NodeOp::TypedView => (CELL, Rep::Ptr),
         NodeOp::TypedLength => (&[Rep::Ptr], Rep::I32),
+        NodeOp::CheckTypedShape { .. } => (TAGGED, Rep::Cell),
+        NodeOp::CheckGetter { .. } => (TAGGED, Rep::None),
+        NodeOp::TypedArrayLength { .. } => (&[Rep::Ptr, Rep::Tagged], Rep::F64),
         NodeOp::TypedData { .. } => (&[Rep::Cell, Rep::Ptr], Rep::Ptr),
         NodeOp::LoadTyped(kind) => (&[Rep::Cell, Rep::Ptr, Rep::I32], kind.rep(false)),
         NodeOp::LoadTypedOrUndefined(_) => {

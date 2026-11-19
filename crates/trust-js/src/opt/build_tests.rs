@@ -5331,6 +5331,11 @@ mod typed_loop;
 #[path = "chain_tests.rs"]
 mod chain;
 
+/// The getter line, (c): a typed array's `length`, `byteLength` and `byteOffset` as the tier's
+/// checks and length node.
+#[path = "typed_getter_node_tests.rs"]
+mod typed_getter_node;
+
 /// An operation the tier does not lower is a generic node (P3 stage 3 step 3a); one that may read
 /// any slot or whose helper runs the VM on a copy of the operand stack stays a canonical-frame
 /// effect (`liveness::SlotUse::Any`, `bytecode::jit_runs_on_vm_copy`).
