@@ -5556,6 +5556,14 @@ fn folded_loads(engine: &mut Engine, names: &[&str]) -> Vec<[usize; 7]> {
 
 #[test]
 fn the_checks_read_the_objects_bytes_at_the_folded_offsets() {
+    // Its counts of the loads in each compiled function depend on the creation epoch, which any
+    // concurrent test moves (a creation way proven in another epoch is walked level by level,
+    // and the walk's checks take registers): its body runs alone, in a child process.
+    if !crate::jit::construct_tests::run_alone(
+        "jit::opt_a64::tests::the_checks_read_the_objects_bytes_at_the_folded_offsets",
+    ) {
+        return;
+    }
     let source = "function A() {} A.prototype.m = function () { return 3; };
          function B() {} B.prototype = Object.create(A.prototype);
          function S1() { this.x = 1; } function S2() { this.a = 0; this.x = 2; }
