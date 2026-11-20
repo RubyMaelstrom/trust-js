@@ -8630,3 +8630,16 @@ exemplars-notes.txt; nothing built).
 - Two questions go to the owner (the handoff note's 18 and 19): buffers whose bytes the
   host shares (built conservatively meanwhile: they keep today's test), and the borrow
   test, which no exemplar has and which stays.
+
+Two tests of the tier's modules failed on main with the tier on from 5697a43a (instanceof's
+landing, 00:45) until 290eb47d (01:45), fixed forward (tests only): opt::inline_tests'
+explicit_input_kinds_give_their_helpers_the_frames_receiver_chunk_and_site and
+generic_operations_of_inlined_callees_give_the_tier_offs_results used instanceof as one of
+the operations an inlined callee runs as a generic node, and the lowering took their sites;
+their setup assertions failed before any result was compared. Their sites are now ones the
+lowering declines by its own rules (a constructor with an own Symbol.hasInstance; a cell
+marked generic by two constructors), so the generic path of a declined instanceof in an
+inlined frame stays tested, and both tests also assert the lowered form in an inlined frame.
+The coordinator's run of the tier's modules with TRUST_JS_OPT=1 on the merged main found it
+(812 passed, 2 failed); instanceof's landing form had its new tests in three configurations
+and no such run. A tier change's landing form carries that run's result line from here on.
