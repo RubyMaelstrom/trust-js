@@ -774,3 +774,79 @@ Read this section before "2026-11-19, 18:00": where they differ, this one holds.
   before charging it to the change, and compare what collections keep at allocation counts
   both binaries share (TRUST_JS_GC_STRESS=100000 TRUST_JS_GC_STRESS_MAJOR=1
   TRUST_JS_GC_INCREMENTAL=0).
+
+## 2026-11-20, 03:15
+
+Read this section before "2026-11-19, midnight": where they differ, this one holds.
+
+- LANDED ON LOCAL MAIN since midnight, each with its record in the plan (search the commit
+  id) unless marked:
+  - 27fea33b: the installs of finished compiles out of jit_interrupt's frame (a collector
+    fix: Djot keeps 6% to 13% fewer objects), with a new rule in AGENTS.md.
+  - 7e7e0a6a, 7cf4f19a: Reflect.set probes the megamorphic store table first (Vue -0.14%);
+    8df2fe98, 7b2e1d1c: tests that assert exact counts run in a child process (the rule is
+    in AGENTS.md's Testing section).
+  - edbcafc1, 02efe116: a native setter a store's way finds is called directly (an
+    embedder's setter 980 instructions a write to 737).
+  - 5697a43a: `instanceof` in the tier's graph (Earley-Boyer -8.2% at graph); 290eb47d: two
+    tests it broke, fixed forward an hour later.
+  - 1be1b6db: the tier's node for a typed array's length (GBEMU -8.0% at graph).
+  - 0c94b35f: a folded typed array's bounds limit as a compare immediate (Mandreel -0.9%).
+  - fe0e1f2c: the template's property creation takes maps of eight or more entries where
+    the layout carries its index (TypeScript -3.3% with the tier off, -4.0% at graph).
+  - c513a576: stage 3's step 7, piece P1: a call the tier does not inline, to a callee the
+    compile knows, calls that callee's current code directly (Mandreel -4.1%, Earley-Boyer
+    -5.2%, Richards -3.7% at graph). ITS RECORD IS NOT WRITTEN YET: the coordinator's check
+    of the commit was clean, and two runs on the merged main (the tier's modules with the
+    tier on; the x86-64 host's check, a fat-LTO build and the adversarial programs) were
+    paused by the heat guard at 03:02 and are owed before it is called done.
+- origin/main is still 6496547c; local main is 155 commits ahead and NOT PUSHED.
+- COUNTED AND NOT BUILT (each a plan record with its numbers): a "probe first" state for
+  megamorphic reads and a store teacher (nothing to reach); the helper taking a store-table
+  hit for a store generated code refused (a measured loss on TypeScript); a typed array's
+  length in line on x86-64 (that template has nowhere to put it: question 20).
+- DECIDED AND BEING BUILT, each with a brief under target/p3/stage3/briefs/ and STATUS.txt
+  / NEXT.txt in its evidence directory:
+  1. The typed data test, stage (A) (f4-part2-stageA.txt; branch p3-s3-f4p7; evidence
+     f4p2-impl): a byte in a typed array view's record marks a fixed-length view of a
+     buffer that cannot be resized; for such a view the tier keeps the data address across
+     calls and re-tests only "attached" and the borrow flag; unfolded views learn "fixed"
+     as JSC does (a bit of the site's element record and an exit reason of its own); a
+     folded object becomes one value of the whole compile (a second commit). Then stage
+     (B), the engine-wide "no buffer was ever detached" bit.
+  2. The graph line (graph-piece3c.txt; branch p3-s3-gp3; evidence gp3-impl): key-checked
+     ways with a set of admitted receiver kinds on CheckShape and CheckProto (built,
+     measured: DeltaBlue -1.7%, PdfJS -1.1%, Djot's steady state -1.8% at graph; its form
+     pending); then what instanceof left with the tier off; then GetMethodElem.
+  3. The megamorphic line (mega-build7.txt; branch p3-s3-mega2; evidence mega-impl): the
+     tier's own creation node past eight entries (6e9e54dc, a landing form but for two
+     result lines the heat pause holds); the store table's slot hash, which hashes
+     addresses and so collides differently in every address layout (a replay is built);
+     the shape-layout directory, whose evictions send 3.27M creations a TypeScript run to
+     the slow path (counts first).
+  4. The getter line (getter5.txt; branch p3-s3-getter4; evidence getter-impl): a
+     JavaScript getter inlined at its read in the tier's graph, JSC's form (Vue's steady
+     state makes 4.1M reads a run through the bundler's export getters, about 11% of its
+     instructions).
+  5. Step 7's next pieces (step7b.txt; branch p3-s3-step7b; evidence s7-impl): known
+     constructors, with a note before code; then the polymorphic call and closures of one
+     function.
+- FOUND AND NOBODY's YET: the tier refuses every function that holds a PushFinally, which
+  the bytecode compiler also emits for a for-of and for a block scope whose binding a
+  closure captures: Vue's reactivity `trigger` never reaches the tier (the plan's record
+  "A coverage gap found on the way"). Earlier ones still stand: a call's cost after a
+  discard and reoptimization; a second way at a property site in the template; inlining
+  ways frozen at the first compile; a string's length and character in the template; Proxy
+  reads (Vue's megamorphic sites send 1.14M reads a steady run to the helper); the timed
+  Octane table against the reference engines, owed since the flip.
+- The owner's open questions are 4, 8, 11 and 12 to 20 above. Nothing is built for 16, 17
+  or 20; 18 is built in its conservative form and 19 keeps its test.
+- Two lessons of the night, both now rules: a tier change's landing form carries the
+  result line of the tier's modules run with TRUST_JS_OPT=1 (instanceof landed without it
+  and broke two tests' setup); a landing that touches a file the other architectures
+  compile carries the x86-64 host's check, clippy and Windows check (the typed-array fold
+  broke that build for two hours).
+- The heat guard (target/p2/timing/HEAT; the unit trustjs-heat-guard) paused every project
+  process at 03:02 on the nightly GPU batch, as it did the night before for 53 minutes.
+  Work resumes by itself; nothing CPU-bound is started while the file exists.
+
