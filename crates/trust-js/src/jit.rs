@@ -303,6 +303,14 @@ mod mega_store_tests;
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
+#[path = "jit_create_indexed_tests.rs"]
+mod create_indexed_tests;
+
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 #[path = "jit_chain_reoptimize_tests.rs"]
 mod chain_reoptimize_tests;
 
@@ -8079,6 +8087,8 @@ fn get_prop_inlinable(layout: &crate::value::JitLayout) -> bool {
         && layout.layout_keys_len.is_multiple_of(4)
         && layout.layout_keys_ptr < 4096
         && layout.layout_keys_len < 4096
+        && layout.layout_index.is_multiple_of(8)
+        && layout.layout_index < 4096
         && std::mem::offset_of!(JitCtx, shape_layouts).is_multiple_of(8)
         && std::mem::offset_of!(JitCtx, shape_layouts) / 8 < 4096
         && layout.shape_layout_entry_size == 16
@@ -15889,12 +15899,11 @@ fn emit_prop_create_probe(
     a.ldrb_imm(9, 11, layout.obj_flags as u32);
     a.tbz(9, flag_bit(crate::value::FLAG_EXTENSIBLE), miss);
     a.tbnz(9, flag_bit(crate::value::FLAG_PROTO), miss);
-    // A small map: no key index of its own, <=8 entries, and room for the next slot (the cell's,
-    // or its record's, W2d step 2).
+    // A map with no key index of its own and room for the next slot (the cell's, or its
+    // record's, W2d step 2). A map that reaches `INDEX_THRESHOLD` entries is tested once its key
+    // layout is settled (`indexed`, below).
     guard_no_key_index(a, layout, 11, 9, miss);
     named_len(a, layout, 13, 11);
-    a.cmp_imm_x(13, 8);
-    a.b_cond(C_HS, miss);
     // Room for the new slot: the way records where it lives (W2d step 3). A record slot that
     // the record lacks room for is made below, out of the line (`grow`).
     let grow = a.new_label();
@@ -15957,7 +15966,12 @@ fn emit_prop_create_probe(
     a.cmp_reg_x(13, 17);
     a.b_cond(C_HS, miss);
     a.bind(key_ready);
-    // Every execution word transfers unchanged.
+    // A map of fewer than `INDEX_THRESHOLD` entries is looked up by a scan and commits here: the
+    // compare stood in front of the layout's search and moved behind it, so this path runs the
+    // instructions it ran. Every execution word transfers unchanged.
+    let indexed = a.new_label();
+    a.cmp_imm_x(13, crate::value::INDEX_THRESHOLD as u32);
+    a.b_cond(C_HS, indexed);
     a.b(commit);
     // The record lacks room for the new slot: make it (W2d step 3), as SpiderMonkey's creation
     // stubs call growSlotsPure and V8's builtin extends its PropertyArray, keeping the way loop's
@@ -15983,6 +15997,29 @@ fn emit_prop_create_probe(
     a.ldp_off(10, 11, 16);
     a.ldp_post(6, 8, 64);
     a.b(room);
+    // A map of `INDEX_THRESHOLD` entries or more (the megamorphic line's creations past eight
+    // entries). The commit writes the value, the layout where one lands, the shape and the count,
+    // and nothing else, so it relies on this: THE KEY LAYOUT THE MAP HOLDS AFTER THE APPEND
+    // CARRIES ITS SHARED INDEX, WHICH ALREADY HOLDS THE NEW KEY AT ITS SLOT, so that every lookup
+    // of every key of this map, and of every other map that shares the layout before or after,
+    // finds its slot through that index (`Props::find`), with no index of the map's own to
+    // build or update; a layout is read-only once shared, so the landing layout's index holds
+    // the key from the layout's making and the staying layout's is untouched. It is the test
+    // `Props::append_new` ends on (`ensure_fallback_index`), which builds the map an index of
+    // its own where the layout carries none: that map takes the helper here, as a map that
+    // already owns an index did above. V8's, SpiderMonkey's and JSC's creation stubs bound no
+    // count because their key table is the shape's (ic/accessor-assembler.cc:1730-1737;
+    // jit/CacheIR.cpp:5714-5728; bytecode/InlineCacheCompiler.cpp:3655-3753); here it is the
+    // shared layout's while the layout carries its index (9 to `SHARED_LAYOUT_MAX_FIELDS` keys).
+    a.bind(indexed);
+    let landing = a.new_label();
+    a.mov(16, 7);
+    a.cbnz(7, true, landing);
+    a.ldr_imm(16, 11, (layout.obj_props + layout.props_layout) as u32);
+    a.bind(landing);
+    a.ldr_imm(16, 16, layout.layout_index as u32);
+    a.cbz(16, true, miss);
+    a.b(commit);
 }
 
 /// The engine-wide store table probed by generated code (the megamorphic line's piece 1c), at a

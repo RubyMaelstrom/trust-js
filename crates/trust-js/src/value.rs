@@ -1505,6 +1505,10 @@ pub struct JitLayout {
     /// A layout's Proxy-trap validation flag (a `bool` byte, [`PropertyLayoutData::validates`]),
     /// within the layout cell.
     pub(crate) layout_validates: usize,
+    /// A layout's shared key index ([`PropertyLayoutData::index`]), within the layout cell: one
+    /// nullable pointer word, null while the layout carries no index. A generated creation on a
+    /// map of [`INDEX_THRESHOLD`] entries or more reads it (`jit::emit_prop_create_probe`).
+    pub layout_index: usize,
     /// The element words' pointer within `Props` (W2c, [`word_block::Words`]): the address of
     /// the first word, never null (a map without words points past the static empty block's
     /// header, whose used length is zero). A word is a plain element's value, a hole the
@@ -1740,10 +1744,22 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
     let validates_ok = layout_validates < 4096
         && std::mem::size_of::<Cell<bool>>() == 1
         && unsafe { ((attrs_word + layout_validates) as *const u8).read() } == 0;
+    // The shared key index's word, measured the same way on that layout, which has two keys and
+    // so no index (a null word).
+    let layout_index = std::ptr::from_ref(&attrs_layout.index)
+        .cast::<u8>()
+        .addr()
+        .wrapping_sub(attrs_word);
+    let index_ok = layout_index < 4096
+        && layout_index.is_multiple_of(8)
+        && std::mem::size_of::<Option<crate::gc_storage::StorageBox<LayoutIndex>>>()
+            == std::mem::size_of::<usize>()
+        && unsafe { ((attrs_word + layout_index) as *const usize).read() } == 0;
     let empty_layout: Option<PropertyLayout> = None;
     let layout_ok = keys_off < 256
         && attrs_ok
         && validates_ok
+        && index_ok
         && attrs_off < 256
         && std::mem::size_of::<PropKey>() == 8
         && std::mem::size_of::<Option<PropertyLayout>>() == std::mem::size_of::<usize>()
@@ -2017,6 +2033,7 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         layout_attrs_len,
         layout_attrs_ptr,
         layout_validates,
+        layout_index,
         props_layout: offset_of!(Props, entries) + offset_of!(NamedEntries, layout),
         layout_keys_len,
         layout_keys_ptr,
@@ -11332,6 +11349,48 @@ impl Props {
     /// *known* child shape: skips the existence scan. A predicted constructor layout also skips
     /// the transition table; otherwise a bounded small-layout lookup supplies shared keys.
     /// `new_shape` must be the transition recorded when this pair was first inserted normally.
+    /// Tests of the generated creation past [`INDEX_THRESHOLD`] entries
+    /// (`jit::create_indexed_tests`): whether the map's layout carries a shared index, whether the
+    /// map owns an index, and whether every key of the map is found at its slot through the
+    /// layout's index alone.
+    #[cfg(test)]
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub(crate) fn test_index_state(&self) -> (bool, bool, bool) {
+        let layout = self.entries.layout.as_ref();
+        let through = layout.is_some_and(|layout| {
+            layout.has_index()
+                && self
+                    .entries
+                    .keys()
+                    .iter()
+                    .enumerate()
+                    .all(|(slot, &key)| layout.indexed_slot(key) == Some(slot))
+        });
+        (
+            layout.is_some_and(|layout| layout.has_index()),
+            self.entries.index().is_some(),
+            through,
+        )
+    }
+
+    /// Tests: give this map a shared layout of `longer`'s keys that carries no index, as a
+    /// layout past [`SHARED_LAYOUT_MAX_FIELDS`] keys carries none: this map's own keys are a
+    /// prefix of `longer`'s, so the layout predicts its next key.
+    #[cfg(test)]
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub(crate) fn test_take_layout_without_index(&mut self, longer: &Props) {
+        let entries: Vec<(PropKey, u8)> = longer
+            .entries
+            .keys()
+            .iter()
+            .enumerate()
+            .map(|(slot, &key)| (key, longer.entries.attrs(slot)))
+            .collect();
+        let layout = PropertyLayout(crate::gc_box::new(PropertyLayoutData::with_attrs(entries)));
+        layout.mark_shared();
+        self.entries.layout = Some(layout);
+    }
+
     pub(crate) fn append_new(&mut self, key: PropKey, prop: Property, new_shape: u32) {
         self.entries.retain_symbol_key(key);
         self.note_structural();
