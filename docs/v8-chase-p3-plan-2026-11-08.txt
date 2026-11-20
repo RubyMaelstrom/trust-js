@@ -8576,3 +8576,13 @@ reach/ts5/summary.txt; no engine code yet).
   full lookup's 1,397, so it should have gained; on TypeScript-5 the hits it adds stop
   repairing the directory (no-layout creations at megamorphic sites 24,935 to 580,976 a
   run). After form 1 it has a few thousand stores left.
+
+A tier test that failed once in a whole-library run runs in a child process (7b2e1d1c;
+2026-11-20; tests only; target/p3/stage3/getter-impl/flake/): jit::opt_a64::tests::
+the_checks_read_the_objects_bytes_at_the_folded_offsets asserts an exact count of a load
+instruction across a compiled function and read 3 against 1 once (the getter line's
+whole-library run of an earlier branch); 0 failures in 20 runs of its filter and in three
+other whole-library runs. The creation epoch is ruled out (moved after and in the middle of
+its warm-up: passes). The cause is not shown; inferred, register allocation or the
+availability of a process-wide shared stub. If it fails in a child, process-wide state is
+ruled out, and the stronger assertion is a count over each node's own code range.
