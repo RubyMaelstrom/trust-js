@@ -8729,3 +8729,73 @@ target/p3/stage3/getter-impl/jsget/note.txt, exemplars.txt; no code yet).
   code (the inliner's requirements, the frame and its exits, the always-wrong cases: a
   replaced getter, per-instance closure getters). A direct call of a getter not inlined
   and a site of several getters have no counted reach and are not built.
+
+F4 part 2, layer 4b landed: a folded typed array's bounds limit is a compare immediate
+(0c94b35f; 2026-11-20 02:34; target/p3/stage3/f4p2-impl/l5/report-4b.txt, the agent's; the
+coordinator's check target/p3/stage3/l4b-review).
+- What it is: a typed array folded from a global, fixed-length over a buffer that is
+  neither resizable nor shared, its count below the 2^31 clamp, has its element accesses'
+  limit as a constant where ARM64's compare holds it as an immediate (ir::limit_immediate);
+  any other limit stays the load. No dependency: V8 folds a constant typed array's length
+  with no protector in both tiers (compiler/js-native-context-specialization.cc:4036-4055;
+  maglev/maglev-graph-builder.cc:4909-4918), and nothing here writes a view record's limit
+  after construction. The coordinator's earlier "the length needs the detach dependency"
+  was wrong for this engine.
+- The rule that makes it sound is the verifier's: a folded limit is consumed only as the
+  bounds limit of an access beside a data test of the same view in the same epoch, and is
+  never the program's `length` (which reads 0 once the buffer is detached): with the rule
+  off, a loop over a detached view reads 64 where the first stage reads 0 (a test pins it).
+- Measured, the coordinator's rows (fat LTO of 17ca01b5 against main's 5697a43a; 200 runs
+  deferred; graph | the splice): Mandreel -0.944% | -1.262%, zlib level; at 5 runs Mandreel
+  -0.38%. Nine of Mandreel's ten typed globals fold (one length is no immediate); none of
+  zlib's eight (2^24 to 2^27): a power-of-two limit by a logical-immediate test is a
+  follow-up to be counted first.
+- Always wrong, the agent's: a view detached before the hot loop: exits, compiles and
+  discards equal to the parent's; detached inside the loop from a callee and from a
+  valueOf, a transfer and the old view: counts equal. Reads crossing the end with a limit
+  that is no immediate cost +2.64% at graph in the first form (the constant made in a
+  scratch register at each use), which is why only immediates fold: -0.006% now.
+  WebAssembly's memory.grow was not run.
+- Checked: the coordinator's 110 adversarial programs at seven modes, against main's
+  engine and under GC stress at graph: none differs. One new, agreeing with Node first:
+  lengths that are and are not compare immediates (0, 1, 1024, 4095, 4096, 4097, 8192,
+  1000003, 2^24), reads and stores at the last index, the length, past it, negative,
+  fractional and huge; the global replaced in mid-loop by a shorter and a longer array,
+  from the loop and from a callee; subarrays with offsets; a resizable buffer's fixed and
+  tracking views shrunk in mid-loop; a detach in mid-loop. The agent's mutations 15 of 15
+  caught; the tier's modules with the tier on 719 passed with the two failures main then
+  had; the x86-64 host's three checks 0. On the merged main its tests and the typed length
+  node's (1be1b6db) pass together with the tier on and eager (65 and 43).
+
+The megamorphic line, creations past eight entries, piece 1a landed: the template (fe0e1f2c;
+2026-11-20 02:40; target/p3/stage3/mega-impl/p1h/f1a/report.txt, the agent's; the
+coordinator's check target/p3/stage3/m1-review).
+- What it is: the template's creation probe takes a creation on a map of eight or more
+  entries where the layout that lands, or the map's own where it predicts the key, carries
+  its shared index; the limit of eight was a count standing where that test belongs. The
+  compare moved behind the key layout's search (the path under eight entries runs its three
+  instructions reordered, its count level by micros); the search was not duplicated out of
+  line, which would have added about 35 instructions to every in-line store site.
+- Measured: the agent's rows by ten randomized runs a side with collections deferred:
+  TypeScript-5 -3.26% with the tier off (SE 0.07%) and -4.04% at graph (SE 0.03%), against
+  a ceiling from micro prices of -2.7%; Djot's steady state -1.22% with the tier off; Box2D
+  and Vue level. The coordinator's fixed-address tables agree: TypeScript -3.15% and -4.02%
+  deferred, Djot's steady state -1.23% and its fixture -0.73% with the tier off; Richards
+  +0.03% and DeltaBlue +0.05% with the tier off (under what fixed addresses resolve).
+  Creations leaving generated code a TypeScript-5 run: 6.21M to 3.99M with the tier off,
+  none left of the 2.22M whose layout carried its index; Djot's 100,250 to none; at graph
+  630,745 remain to the tier's own StoreNew (piece 1b, built, in its checks).
+- Its known price: a creation refused for want of a layout with its index now runs the
+  search first: about +23 instructions on a refused creation of about 3,400. A map with an
+  index of its own leaves at its guard as before (1,043 to 1,040 a creation).
+- Checked: the coordinator's 109 adversarial programs at seven modes, against main's
+  engine and under GC stress at graph: none differs. One new, agreeing with Node first:
+  creations on maps of 7 to 34 entries at megamorphic and monomorphic sites with every key
+  read back six ways; a twin of one shape gaining the next key; a delete and re-add past
+  eight entries; an accessor and a read-only slot defined between creations; frozen,
+  sealed and non-extensible receivers; a symbol and index-like names as the ninth key; a
+  prototype gaining and losing a setter for the next key; Object.create(null); a receiver
+  that is a prototype. The agent's four mutations caught; GC stress on its tests; its
+  whole-library run 3,865 passed with the two failures main then had; the x86-64 host's
+  three checks 0. x86-64 has no generated creation at all (owed work, with the owner's
+  question 20).
