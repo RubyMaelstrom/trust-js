@@ -8812,3 +8812,67 @@ of this kind in the counted workloads: Vue 3, Djot 1, none in React or Octane at
 To be counted (which functions, what share of each workload's instructions they run) and
 designed from the exemplars (how Maglev, the DFG and Ion build a finally's completions and
 a block scope's environment pops) as a piece of its own.
+
+Stage 3's step 7, piece P1 landed: a known callee the tier does not inline is called
+directly (c513a576; 2026-11-20 02:56; target/p3/stage3/s7-impl/report-p1.txt, the agent's;
+the coordinator's check target/p3/stage3/s7-review; the validation of the merged main
+target/p3/stage3/pause-check).
+- What it is. Each code slot keeps an entry word (the resident code's address, its entry
+  and its pc table; zero when the slot holds no code a call may enter), written by every
+  change of the slot's code under the same borrow: a compile's commit and its rollback, an
+  install in place, a discard, a reoptimization, the code cache's eviction, a chunk's
+  supersession. A call the tier does not inline whose record names exactly one user
+  function the template's own direct path would accept reads that word at each call and
+  enters the callee's current code; a zero word takes the template's call. No code address
+  is embedded (the design note's fork F2), as V8's calls read a function's dispatch-table
+  entry and SpiderMonkey's its script's jitCodeRaw. The callee guard stands in front; where
+  the fold of a function held in a global already proves the callee (b5b97df1), no guard
+  is built. A site that met another closure of a way's function is refused (piece P3's
+  case). The whole call contract is one function, jit::emit_known_sequence. The guard's
+  words load from the literal pool, which also takes 3 instructions off every inlined
+  way's guard.
+- Measured, the coordinator's rows (fat LTO of fbac1091 against main's 5697a43a-era
+  engine fe0e1f2c's parent line; graph; collections deferred): at 200 runs Mandreel
+  -4.08%, Earley-Boyer -5.15%, Richards -3.73% (at the splice Richards -1.83%, the others
+  unchanged: the form is the graph's); at 5 runs Earley-Boyer -4.5%, Mandreel -1.25%,
+  Vue's fixture -1.09% and steady state -1.25%, Djot's steady state -0.91%, TypeScript
+  -0.80%, Box2D -0.61%, Octane's geometric mean -1.0%. The agent's 200-run rows beside
+  them: Box2D -1.71%, TypeScript -1.40%, RegExp -0.72%, zlib -0.22%. A known call saves 25
+  instructions in the micro (244 to 219) and 32 with a folded callee and no guard (222 to
+  190): less than the design note's 64, because the check of the interpreter's construct
+  state reads live engine state and stays.
+- The tier off: every 5-run row level but TypeScript, which read +0.39% (the agent) and
+  +0.41% (the coordinator) at fixed addresses and +0.040% (SE 0.045%, medians equal) over
+  ten randomized runs a side with collections deferred: one draw. The direct-calls binary
+  spread wider in those runs (sd 0.14% against 0.02%); the megamorphic store table's slot
+  hash was found the same night to hash addresses, the likely cause (the megamorphic
+  line's next piece).
+- Always wrong, the agent's: a callee alternating at every call unchanged (286.5
+  instructions a call); a callee replaced once after the compile: each later activation
+  exits once at the guard and finishes in first-stage code (396 a call against main's 277)
+  until the exit limit discards, after which the site calls generically. V8 discards at
+  its first such deoptimization; to be counted and weighed (the line's next agent has it).
+- Three defects of an earlier form, all found by the tier's modules run with the tier on:
+  the direct path skipped the call template's end poll; the code held callee chunks in a
+  thread-local (an abort at thread teardown); sites that had met another closure were
+  taken. All fixed before the landing form.
+- Checked: the coordinator's 111 adversarial programs at seven modes, against main's
+  engine and under GC stress at graph: none differs. One new, agreeing with Node first:
+  argument counts under and over the parameters, default and rest parameters, `arguments`,
+  sloppy and strict `this` with primitives, construction with new.target through arrows, a
+  derived class, Reflect.construct with another newTarget and a constructor returning an
+  object, recursion to a stack overflow and back, a throwing callee's stack, a callee
+  replaced in mid-loop, a callee that keeps leaving its optimized code, a caller
+  invalidated from inside its callee. The agent's mutations: ten of eleven caught; not
+  caught: the WrongCallee flag ignored, which matters only where the template's fill of
+  the site's record was refused (an owed test). Its Test262 eager 53,572 of 53,575; the
+  x86-64 host's three checks 0.
+- The merged main, validated after the unscheduled reboot of 03:44 (the two runs it
+  interrupted, and more): the tier's modules with TRUST_JS_OPT=1 832 passed, 0 failed;
+  Test262 eager at graph 53,572 of 53,575; difftest 138 agree in three configurations; 59
+  adversarial programs at seven modes on main's own fat LTO (target/p2/lto/c513a576)
+  against main before this piece, GC stress among them: none differs; fmt and clippy -D
+  warnings clean; the x86-64 host's check, clippy and Windows check 0; the release runtime
+  builds and runs. The whole library with the tier off was stopped by the heat guard at
+  3,302 passed, 0 failed of about 3,900 (04:44, a second GPU batch); its rerun is recorded
+  below when it ends.
