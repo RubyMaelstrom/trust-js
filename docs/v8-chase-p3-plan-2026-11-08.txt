@@ -8799,3 +8799,16 @@ coordinator's check target/p3/stage3/m1-review).
   whole-library run 3,865 passed with the two failures main then had; the x86-64 host's
   three checks 0. x86-64 has no generated creation at all (owed work, with the owner's
   question 20).
+
+A coverage gap found on the way, nobody's yet (2026-11-20;
+target/p3/stage3/getter-impl/jsget/pc216/dump.err): the tier's builder refuses every chunk
+that holds a PushFinally (opt/build.rs:290-293, "finally and its completions"), and the
+bytecode compiler emits one not only for a source try/finally but for a block scope whose
+binding a closure captures (each completion pops the environment) and for for-of. Vue's
+reactivity `trigger` (function O(e,t,n,o,i,s) of the fixture: `{const e=Number(o);
+c.forEach((t,n)=>{...e...})}` and `for(const t of u)`) is refused for it twice a steady
+run and stays in first-stage code; it carries 199,360 of the run's getter reads. Refusals
+of this kind in the counted workloads: Vue 3, Djot 1, none in React or Octane at 5 runs.
+To be counted (which functions, what share of each workload's instructions they run) and
+designed from the exemplars (how Maglev, the DFG and Ion build a finally's completions and
+a block scope's environment pops) as a piece of its own.
