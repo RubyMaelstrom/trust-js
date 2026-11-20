@@ -8489,7 +8489,7 @@ item1-report.txt).
   (p1g/proxy/per-read.txt); inferred, the engine's own dispatch is about 3% of Vue's steady
   state at graph.
 
-Graph piece 3, `instanceof` landed (5697a43a; 2026-11-20 00:45;
+Graph piece 3, `instanceof` landed (5697a43a; 2026-11-20 00:41;
 target/p3/stage3/gp3-impl/io-commit-msg.txt, report2.txt, q-io3/, the agents'; the
 coordinator's check target/p3/stage3/io-review).
 - What it is: `x instanceof F` whose site's cell holds one plain constructor is built in the
@@ -8533,7 +8533,7 @@ coordinator's check target/p3/stage3/io-review).
   FoldedGlobal word on the right-hand side; its shape check and CheckCtor are still built
   (no dependency replaces them yet).
 
-Creations that leave generated code: counted, and the next piece decided (2026-11-20 01:20;
+Creations that leave generated code: counted, and the next piece decided (2026-11-20 01:13;
 target/p3/stage3/mega-impl/p1h/note.txt, exemplars.txt, which/table.txt, which/takes.txt,
 reach/ts5/summary.txt; no engine code yet).
 - The count. On TypeScript-5 6.21M property creations a run leave generated code (the
@@ -8587,7 +8587,7 @@ its warm-up: passes). The cause is not shown; inferred, register allocation or t
 availability of a process-wide shared stub. If it fails in a child, process-wide state is
 ruled out, and the stronger assertion is a count over each node's own code range.
 
-The typed data test: split, and the next two pieces decided (2026-11-20 01:35;
+The typed data test: split, and the next two pieces decided (2026-11-20 01:28;
 target/p3/stage3/f4p2-impl/l5/note-typed-fact.txt, split-summary.txt, note-item3.txt,
 exemplars-notes.txt; nothing built).
 - The split, by class of each test on its finished graph, as a share of the workload at 200
@@ -8632,7 +8632,7 @@ exemplars-notes.txt; nothing built).
   test, which no exemplar has and which stays.
 
 Two tests of the tier's modules failed on main with the tier on from 5697a43a (instanceof's
-landing, 00:45) until 290eb47d (01:45), fixed forward (tests only): opt::inline_tests'
+landing, 00:41) until 290eb47d (01:30), fixed forward (tests only): opt::inline_tests'
 explicit_input_kinds_give_their_helpers_the_frames_receiver_chunk_and_site and
 generic_operations_of_inlined_callees_give_the_tier_offs_results used instanceof as one of
 the operations an inlined callee runs as a generic node, and the lowering took their sites;
