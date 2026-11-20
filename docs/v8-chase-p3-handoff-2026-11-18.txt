@@ -901,8 +901,9 @@ second unscheduled reboot. Where an older section differs, this one holds.
      in its build) and the shape-layout directory's counts.
   2. p3-s3-gp3 (worktree gp3-wt; brief graph-piece3c.txt; evidence gp3-impl): 798febf5 is
      the key-checked ways' fix with the set of admitted receiver kinds on CheckShape and
-     CheckProto, a WORK FORM already rebased over direct calls and measured before that
-     rebase (DeltaBlue -1.74%, PdfJS -1.07%, Djot's steady state -1.85% at graph, 200
+     CheckProto, a WORK FORM rebased over direct calls (that rebase was never built or tested: the
+     crash cut off its nearest tests and x86-64 checks, kcnear.log and zombie-kc5.log are
+     empty) and measured before that rebase (DeltaBlue -1.74%, PdfJS -1.07%, Djot's steady state -1.85% at graph, 200
      runs; 16 of 17 mutations caught). Owed for its landing form: the tier's modules with
      the tier on (the run was 456 of 814 in with no failure), the mutants and the x86-64
      host's checks on the rebased tree, its commit message (report3.txt has the text's
