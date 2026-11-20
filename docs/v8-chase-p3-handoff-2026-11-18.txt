@@ -881,9 +881,9 @@ second unscheduled reboot. Where an older section differs, this one holds.
   stress among them, on main's own fat LTO: none differs; the x86-64 host's check, clippy
   and Windows check 0. `cargo build --release -p trust-js-cli` builds
   target/release/trust-js-cli, and a smoke program gives Node's output with the tier off,
-  on, and eager. The whole library with the tier off was stopped by the guard at 3,302
-  passed, 0 failed of about 3,900 when a second GPU batch started at 04:44; its rerun's
-  result is the last line of the plan when it is in. The default configuration is
+  on, and eager. The whole library with the tier off: 3,886 passed, 0 failed, 11 ignored
+  (a first run was stopped by the guard at 3,302 passed when a second GPU batch started
+  at 04:44; this is its rerun after the machine cleared, ended 05:27). The default configuration is
   unchanged: the tier is off unless TRUST_JS_OPT=1.
 - origin/main is still 6496547c. Local main is about 160 commits ahead and NOT PUSHED: the
   whole of stage 3 since 2026-11-18 exists only on this machine's disk.

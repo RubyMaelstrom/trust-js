@@ -8876,3 +8876,9 @@ target/p3/stage3/pause-check).
   builds and runs. The whole library with the tier off was stopped by the heat guard at
   3,302 passed, 0 failed of about 3,900 (04:44, a second GPU batch); its rerun is recorded
   below when it ends.
+
+Validation at the pause, completed 2026-11-20 05:27: the whole library suite with the tier
+off in a clean environment on main's engine (c513a576), from a copied test binary on six
+cores after the heat guard cleared: 3,886 passed, 0 failed, 11 ignored
+(target/p3/stage3/pause-check/suite-off2.log). With it every check of the pause is in: see
+the handoff note's section "2026-11-20, 04:50: THE PAUSE".
