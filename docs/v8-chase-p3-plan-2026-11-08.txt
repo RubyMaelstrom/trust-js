@@ -8532,3 +8532,47 @@ coordinator's check target/p3/stage3/io-review).
 - Where it meets the folds of the same night: a constructor folded from a global is a
   FoldedGlobal word on the right-hand side; its shape check and CheckCtor are still built
   (no dependency replaces them yet).
+
+Creations that leave generated code: counted, and the next piece decided (2026-11-20 01:20;
+target/p3/stage3/mega-impl/p1h/note.txt, exemplars.txt, which/table.txt, which/takes.txt,
+reach/ts5/summary.txt; no engine code yet).
+- The count. On TypeScript-5 6.21M property creations a run leave generated code (the
+  template's store stub with the tier off; at graph 2.01M through the helper and 4.29M
+  through the tier's own StoreNew slow call, which the first count had not seen). What
+  refuses them: the generated creation's limit of eight entries, 4.16M with the tier off;
+  no cached layout for the shape, 3.27M (1.35M of them under eight entries); a key index of
+  the object's own, 0.56M. The megamorphic sites' two carriers are the AST base
+  constructor's last two stores, at 8 and 9 entries. Djot's steady state has 100,250 on the
+  limit with the tier off, Box2D 8,505; Splay, Vue and React none that matter.
+- What the limit is for. Past eight entries a map is looked up through an index: the shared
+  layout's own (layouts of 9 to 16 keys carry one) or one the object owns, which
+  Props::append_new builds by allocating and hashing. The generated sequence already grows
+  the storage and installs the landing layout; the one duty it lacks is that index. So the
+  limit is a count standing where a test of the layout's index belongs. V8
+  (ic/accessor-assembler.cc:1730-1737, 1957, 2510-2580), SpiderMonkey (jit/CacheIR.cpp:
+  5714-5728, BaselineCacheIRCompiler.cpp:959-977) and JSC
+  (bytecode/InlineCacheCompiler.cpp:3655-3753) do nothing per object at that point but grow
+  the storage and write value and shape: the key table is the shape's for its whole life.
+- DECIDED, form 1, in two commits each with its own rows: the template's creation probe
+  takes a creation of eight or more entries where the layout that stays or lands carries
+  its index (1a), and the tier's StoreNew the same (1b). Reach 2.22M creations a run on
+  TypeScript-5; a ceiling from micro prices of 2.7% with the tier off and 3.2% at graph,
+  to be replaced by the measured row. The path under eight entries executes what it does
+  today. x86-64 has no generated creation and keeps its limit (owed work, to be sized).
+- A second finding of the same size, counts first: the shape-layout directory is a
+  4,096-entry direct-mapped cache (property_shapes.rs:97-100) and an evicted layout is put
+  back only by the full insert, never by a cache hit. A micro: after 6,000 one-key shapes,
+  8,000,000 of 8,000,000 creations leave generated code for good, +520 instructions each
+  with the tier off and +325 at graph. On TypeScript-5 it is the 3.27M "no layout"
+  creations. Next on the line after form 1: how many shapes are live at each workload's
+  peak and what a layout for each weighs; how the exemplars bound it (V8's descriptor
+  arrays shared along a transition chain, SpiderMonkey's shared property maps, JSC's
+  PropertyTable, materialized on demand and handed along transitions); and the smallest
+  repair in today's design, a cache hit re-inserting an evicted layout.
+- CLOSED as measured: the helper's table hit for a store the generated probe refused
+  (probing despite the token: TypeScript-5 +0.23% with the tier off and +0.28% at graph by
+  ten randomized runs, the always-wrong creation +38 instructions; the token left only at
+  the entry's own mismatch: level). In a micro the hit costs 641 instructions against the
+  full lookup's 1,397, so it should have gained; on TypeScript-5 the hits it adds stop
+  repairing the directory (no-layout creations at megamorphic sites 24,935 to 580,976 a
+  run). After form 1 it has a few thousand stores left.
