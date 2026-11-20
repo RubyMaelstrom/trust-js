@@ -8694,3 +8694,7 @@ off, x86-64 runs Octane at a geometric mean of 4.9 times ARM64's user instructio
 fixtures at 3.2 to 3.7; Code-Load reads the same on both. In the worst four, 83% to 92% of
 the instructions are in helpers: operations handed to the VM one at a time, arithmetic, and
 element access. What follows is the owner's (the handoff note's question 20).
+
+Validation, 2026-11-20: the tier's modules with TRUST_JS_OPT=1 on the tree of 290eb47d
+(instanceof in, the two generic-node tests repaired): 814 passed, 0 failed
+(target/p3/stage3/gp3-impl/fix-run/mods.on.log).
