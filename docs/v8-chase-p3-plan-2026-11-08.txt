@@ -8698,3 +8698,34 @@ element access. What follows is the owner's (the handoff note's question 20).
 Validation, 2026-11-20: the tier's modules with TRUST_JS_OPT=1 on the tree of 290eb47d
 (instanceof in, the two generic-node tests repaired): 814 passed, 0 failed
 (target/p3/stage3/gp3-impl/fix-run/mods.on.log).
+
+JavaScript getters reached from tier code: counted, and the form decided (2026-11-20;
+target/p3/stage3/getter-impl/jsget/note.txt, exemplars.txt; no code yet).
+- The count, at graph, by an instrument that keeps every user-getter read on the helper:
+  Vue's steady state 4,099,320 reads a run at a validated accessor way, 3,865,553 of them
+  from tier code, at 24 sites; Box2D 47,258 at 5 runs; Djot 184; PdfJS 56; React and the
+  other twelve Octane benchmarks none. Every site reads one getter function. Vue's are
+  the bundler's module export getters (`NAME:function(){return X}` on a module's exports
+  object, read as `(0,r.kJ)(e)`): one load of a captured binding. All are found by a way
+  on an ordinary receiver; at most 220 a run come through a Proxy's or another generic
+  [[Get]]. Four sites holding 2.40M of the reads sit in one function that every Proxy
+  [[Get]] entering through Rust runs once (inferred: the reactive get handler).
+- The cost, from micros: a read through an export getter is 283 instructions with the tier
+  off and 282 at graph (a field: 52 and 17): the tier builds the generic node and gains
+  nothing. Applied to the count: about 1.02G of Vue's 9.26G, 11%; inlined, about ten
+  instructions a read.
+- The exemplars all put the getter's body in the reading graph at a one-function site,
+  with a frame kind of its own for exits: V8 takes the getter as a constant from the map
+  and builds a call its inliner takes (compiler/js-native-context-specialization.cc:
+  2881-2925, 3077-3101; maglev/maglev-graph-builder.cc:4067-4097); JSC loads the getter
+  from the slot and inlines on the cache's call status behind a callee check
+  (dfg/DFGByteCodeParser.cpp:7393-7397, 7600-7605, InlineCallFrame::GetterCall);
+  SpiderMonkey's trial inlining makes the site's call CallInlinedGetterResult
+  (jit/TrialInlining.cpp:923-967). V8's form without a check does not transfer: a shape
+  here pins the slot, not the accessor pair.
+- DECIDED: the inlined getter in JSC's form (the ways' shape checks, the slot's getter
+  compared at run time, the body built by the call inliner, an accessor kind of inlined
+  frame so that an exit resumes the reader after the read). Its design note comes before
+  code (the inliner's requirements, the frame and its exits, the always-wrong cases: a
+  replaced getter, per-instance closure getters). A direct call of a getter not inlined
+  and a site of several getters have no counted reach and are not built.
