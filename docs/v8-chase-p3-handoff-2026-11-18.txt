@@ -287,6 +287,12 @@ Each is recorded where the plan line says; none blocks the lines above.
    buffer. A violated contract would be a use of freed memory from generated code, so this
    is the owner's. Until answered the piece is built with (i): host-shared views keep
    today's test, and nothing else depends on the answer.
+   A cost of (i) found while building (2026-11-20 03:27): most typed sites are warmed in
+   template code, which records a view's element kind and not whether it is fixed, so the
+   tier first compiles such a site as fixed; under (i) every function with typed sites over
+   a WebAssembly memory's views therefore takes one exit and is compiled twice (bounded:
+   one discard a function, measured on zlib with its heap made resizable; the row is in
+   that piece's report).
 19. From the same note (section 3): THE BORROW TEST. Every typed element access tests that no
    native code holds a borrow of the buffer's bytes (two instructions, re-tested after every
    effect). No exemplar has such a test: it guards Rust's aliasing rule (generated code
