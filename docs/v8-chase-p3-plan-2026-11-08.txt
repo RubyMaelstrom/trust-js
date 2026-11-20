@@ -8831,8 +8831,8 @@ target/p3/stage3/pause-check).
   case). The whole call contract is one function, jit::emit_known_sequence. The guard's
   words load from the literal pool, which also takes 3 instructions off every inlined
   way's guard.
-- Measured, the coordinator's rows (fat LTO of fbac1091 against main's 5697a43a-era
-  engine fe0e1f2c's parent line; graph; collections deferred): at 200 runs Mandreel
+- Measured, the coordinator's rows (fat LTO of fbac1091 against target/p2/lto/5697a43a,
+  main's engine at its base; graph; collections deferred): at 200 runs Mandreel
   -4.08%, Earley-Boyer -5.15%, Richards -3.73% (at the splice Richards -1.83%, the others
   unchanged: the form is the graph's); at 5 runs Earley-Boyer -4.5%, Mandreel -1.25%,
   Vue's fixture -1.09% and steady state -1.25%, Djot's steady state -0.91%, TypeScript

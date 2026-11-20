@@ -856,3 +856,82 @@ Read this section before "2026-11-19, midnight": where they differ, this one hol
   process at 03:02 on the nightly GPU batch, as it did the night before for 53 minutes.
   Work resumes by itself; nothing CPU-bound is started while the file exists.
 
+## 2026-11-20, 04:50: THE PAUSE
+
+Read this section first: it is where the work was set down, on the owner's word, after a
+second unscheduled reboot. Where an older section differs, this one holds.
+
+- WHAT HAPPENED. The machine restarted at 03:44. The heat guard had held every process of
+  this project stopped since 03:02 (86 C when the nightly GPU batch started); the sensors
+  still read 80 to 89 C with the GPU at 96% and nothing of this project running, and the
+  previous boot's journal ends with the root filesystem going read-only at 03:39. So the
+  GPU batch alone can take the machine down. The repository (on another disk) was intact:
+  `git fsck` clean; only logs of stopped runs were empty.
+- WHAT WAS REPAIRED. The heat guard is a transient unit and was gone: its stale
+  target/p2/timing/HEAT was removed and the unit started again (see "The crash of
+  2026-11-16, and the heat guard"; do this first after any reboot). Three worktrees held
+  uncommitted work: each is saved as a commit named "WIP (unfinished, saved after the
+  unscheduled reboot ...)" on its own branch. A half-written target/p2/lto/c513a576 was
+  removed and built again.
+- MAIN IS THE USABLE BUILD. Its engine code is c513a576's (the commits after it are
+  records and this note). Validated at the pause (target/p3/stage3/pause-check): fmt;
+  clippy -D warnings with tests; the tier's modules with TRUST_JS_OPT=1 832 passed, 0
+  failed; Test262 with the tier on and eager at graph 53,572 of 53,575 (the three known);
+  difftest 138 agree in three configurations; 59 adversarial programs at seven modes, GC
+  stress among them, on main's own fat LTO: none differs; the x86-64 host's check, clippy
+  and Windows check 0. `cargo build --release -p trust-js-cli` builds
+  target/release/trust-js-cli, and a smoke program gives Node's output with the tier off,
+  on, and eager. The whole library with the tier off was stopped by the guard at 3,302
+  passed, 0 failed of about 3,900 when a second GPU batch started at 04:44; its rerun's
+  result is the last line of the plan when it is in. The default configuration is
+  unchanged: the tier is off unless TRUST_JS_OPT=1.
+- origin/main is still 6496547c. Local main is about 160 commits ahead and NOT PUSHED: the
+  whole of stage 3 since 2026-11-18 exists only on this machine's disk.
+- NO AGENT IS RUNNING. Five lines were in flight; each stands on its branch with its
+  brief (target/p3/stage3/briefs/), its evidence directory's STATUS.txt and NEXT.txt, and
+  what resuming takes:
+  1. p3-s3-mega2 (worktree mega2-wt; brief mega-build7.txt; evidence mega-impl): 6e9e54dc
+     is piece 1b, the tier's property creation past eight entries, a LANDING FORM
+     (p1h/f1b/report.txt: TypeScript -0.33% and Djot's steady state -0.68% at graph by
+     randomized runs) but for two result lines the crash cut off (rerun
+     p1h/f1b/checks2.sh: the tier's modules with the tier on, the whole library). It is
+     over main 5501b085: rebase onto main (direct calls touched opt/a64.rs), the x86-64
+     host's checks on that tree, the coordinator's check, then it lands. After it: the
+     store table's slot hash (it hashes addresses; the replay p1h/slot/run.sh was cut off
+     in its build) and the shape-layout directory's counts.
+  2. p3-s3-gp3 (worktree gp3-wt; brief graph-piece3c.txt; evidence gp3-impl): 798febf5 is
+     the key-checked ways' fix with the set of admitted receiver kinds on CheckShape and
+     CheckProto, a WORK FORM already rebased over direct calls and measured before that
+     rebase (DeltaBlue -1.74%, PdfJS -1.07%, Djot's steady state -1.85% at graph, 200
+     runs; 16 of 17 mutations caught). Owed for its landing form: the tier's modules with
+     the tier on (the run was 456 of 814 in with no failure), the mutants and the x86-64
+     host's checks on the rebased tree, its commit message (report3.txt has the text's
+     parts). Above it: 9acee01c and d02a2540, GetMethodElem's teacher and lowering (WIP:
+     they pass their seven tests, nothing measured), and 5ed1ec61, a second form of the
+     instanceof helper's follow-up (its exit: Earley-Boyer and PdfJS at or below zero with
+     the tier off by randomized runs, else closed as the teacher's price, +0.016%).
+  3. p3-s3-f4p7 (worktree f4p7-wt; brief f4-part2-stageA.txt; evidence f4p2-impl, l6/):
+     stage (A) of the typed data test as WIP commits 440427c6, 77d7019f, 87c762a0 and the
+     saved 8d28bfbe: the record's "fixed" byte, the writers' assertions, the split nodes,
+     the verifier's rule, 14 tests passing before its last rebase. Owed: squash; the
+     second commit Q (a folded object as one value of the compile; its tests are written);
+     every row (nothing is measured); the zlib always-wrong case (l6/tools/zlibb.sh); the
+     mutations (9 of 19 run); the 30 tests pinned to the old form sorted into "about the
+     old path" and "general", the general ones unpinned or twinned; the modules line.
+  4. p3-s3-getter4 (worktree getter4-wt; brief getter5.txt; evidence getter-impl, jsget/):
+     a11bfaf6 is the inlined JavaScript getter as the crash left it (12 files, a new test
+     file), never built as a commit. The design is jsget/design.txt with the coordinator's
+     answers in the plan's record and in getter5.txt (the teacher is the read's getter
+     call cache read at every compile; no live read of the slot; own-frame read sites
+     only; the eight-getter replaced-at-once measurement in two warm-up shapes decides
+     whether a holder record is needed).
+  5. p3-s3-step7b (worktree s7b-wt; brief step7b.txt; evidence s7-impl, p5/): 2a272225 is
+     one unfinished test (opt/called_tests.rs). The count for known constructors was
+     scripted (p5/build-count.sh, p5/p5.jobs) and had not run; its note is not written.
+  The agents' transcripts are kept by the tool that ran them; a fresh agent started from
+  a brief needs nothing from them.
+- NOT STARTED, each with its record in the plan: the tier refusing every function with a
+  PushFinally (a for-of, a captured block binding: Vue's reactivity `trigger`); x86-64's
+  template (question 20); and the unassigned items listed in the 03:15 section.
+- The owner's open questions are 4, 8, 11 and 12 to 20, above.
+
