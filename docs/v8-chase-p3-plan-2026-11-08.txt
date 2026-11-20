@@ -8643,3 +8643,40 @@ inlined frame stays tested, and both tests also assert the lowered form in an in
 The coordinator's run of the tier's modules with TRUST_JS_OPT=1 on the merged main found it
 (812 passed, 2 failed); instanceof's landing form had its new tests in three configurations
 and no such run. A tier change's landing form carries that run's result line from here on.
+
+The getter line's piece (c) landed: the tier's node for a typed array's length (1be1b6db;
+2026-11-20 02:09; target/p3/stage3/getter-impl/msg-c.txt, report3.txt, the agent's; the
+coordinator's check target/p3/stage3/c-review).
+- What it is: a named read of length, byteLength or byteOffset whose ways are all a typed
+  array's accessor ways on one walk is built in the graph: a check of the receiver's kind
+  and shape (CheckTypedShape, a sibling of CheckShape until the graph line's set of
+  admitted kinds lands; it records no shape fact), the walk's prototype checks, a check
+  that the live getter is the intrinsic's (CheckGetter, exit WrongCallee), then the answer
+  from the view's record with selects: 0 for a detached buffer or a view out of bounds, a
+  cold call for a view with no record or at the 2^31 clamp. Its teacher is the snapshot,
+  which reads the live getter at %TypedArray.prototype% on the main thread: a replaced
+  getter makes the next compile keep the generic access.
+- Measured, the coordinator's rows (fat LTO of 8e1c2d71 against main's 5697a43a; 200 runs,
+  collections deferred; graph | the splice): GBEMU -7.96% | -7.95%, Mandreel -0.22% |
+  -0.21%; GBEMU at 5 runs -4.3%. A read in tier code 124 instructions to 76 (the agent's
+  micro). The tier off level in every row (no file outside opt/). Plain 5-run rows of Splay
+  (+2.0%) and PdfJS (+0.2%) at graph were the incremental marker under load on the
+  counting core: with the marker not incremental on a free core +0.002% and -0.074%.
+  The agent's randomized rows of two workloads that read no typed array: Richards +0.015%,
+  DeltaBlue +0.019% at graph (per-compile work of the snapshot and the builder; inferred).
+- Always wrong, the agent's: a site alternating two kinds level (it stays generic: one
+  walk only; a polymorphic form is not built); the getter replaced 200 times: 100 exits,
+  3 compiles, +0.018%.
+- Checked: the coordinator's 96 adversarial programs at seven modes, against main's engine
+  and under GC stress at graph: none differs. One new, agreeing with Node first: one
+  element kind at each hot site so that the node is built, and everything that changes the
+  answer done in the middle of the loop that reads it (a transfer, a resize out of bounds
+  and back, a length-tracking view shrinking and growing, the getter replaced and restored,
+  an own shadow added and deleted, the prototype changed, an intermediate prototype gaining
+  the name), the length as a loop bound with a detach inside the body, an inlined reader, a
+  BigInt view, two kinds at one site, a subclass's own getter, other receivers at the
+  warmed sites. The agent's mutations 14 of 15 caught (the clamp's decline needs a view of
+  2^31 elements); the tier's modules with the tier on 788 passed with the two failures
+  main then had; the verifier sweep clean; the x86-64 host's three checks 0. On the merged
+  main the node's tests, instanceof's and the two repaired generic-node tests pass with the
+  tier on (20 of 20).
