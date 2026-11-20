@@ -266,6 +266,40 @@ Each is recorded where the plan line says; none blocks the lines above.
    its own design note brought back before any code, once the direct call has landed and
    measured the call site's share.
 
+18. From the global dependencies' line (2026-11-20; target/p3/stage3/f4p2-impl/l5/
+   note-item3.txt, section 2): BUFFERS WHOSE BYTES THE HOST SHARES. The next piece of that
+   line lets the tier keep a typed array's data address across calls and drop its
+   end-of-storage test, for a fixed-length view of a buffer that cannot be resized: such a
+   buffer's storage never changes length or address while it is attached, and the tier still
+   tests "attached" after every effect. That holds by the engine's own writers for a buffer
+   whose bytes are the engine's. A WebAssembly memory's buffer shares its bytes with the
+   host: the web crate grows the Vec (which may move it) and then detaches the buffer over
+   it, inside one native call (wasm_ops.rs:283-300). The fork: (i) views of host-shared
+   bytes are never "fixed" and keep today's full test; (ii) they are, under a contract of the
+   embedding API: a shared block never shrinks while a buffer over it is attached, and any
+   growth or move is followed by that buffer's detach before control returns to JavaScript.
+   V8 treats a memory's buffer as any other and relies on grow's detach, with the old bytes
+   kept alive by the backing store's ownership. Recommended: (ii), since the views of a
+   WebAssembly memory are what compiled pages index (Emscripten's heap views), and in the
+   form where the contract is the API's shape and not the host's discipline: one engine
+   operation that grows a shared block and detaches every buffer over it, the raw block not
+   handed out for growth, a debug assertion where a block's length changes under an attached
+   buffer. A violated contract would be a use of freed memory from generated code, so this
+   is the owner's. Until answered the piece is built with (i): host-shared views keep
+   today's test, and nothing else depends on the answer.
+19. From the same note (section 3): THE BORROW TEST. Every typed element access tests that no
+   native code holds a borrow of the buffer's bytes (two instructions, re-tested after every
+   effect). No exemplar has such a test: it guards Rust's aliasing rule (generated code
+   touching bytes that native code holds a Ref or RefMut of is undefined behaviour), not a
+   JavaScript one. After the pieces above it is most of what is left of the data test (about
+   2% of Mandreel's instructions, 1% of zlib's and GBEMU's, with the observed flag). Removing
+   it needs an audit showing that no native function, in the engine or an op crate, can run
+   JavaScript or generated code while it holds a borrow of any buffer's bytes, and that the
+   embedding API hands out no borrow that outlives a call; the test would then become a
+   debug assertion at the boundary from native code to JavaScript. Recommended: keep it now;
+   the audit as a piece of its own when the pieces before it have landed and its share is
+   measured, not inferred.
+
 ## How the work is done
 
 - A design record before code. Each stage and each step that makes a choice has a note in the plan
@@ -701,10 +735,12 @@ Read this section before "2026-11-19, 18:00": where they differ, this one holds.
      a monomorphic call the tier does not inline calls its callee's current entry through
      a word the chunk keeps; a function folded from a global is a known callee with no
      guard (263.5M of Mandreel's 351.6M such calls at 200 runs).
-- The owner's open questions are 4, 8, 11 and 12 to 17 above. 12 to 15 are built on their
-  recommendations meanwhile, each separable; nothing is built for 16 (an accessor kind in
-  the embedding API) or 17 (machine-stack frames for calls between the tier's codes) until
-  they are answered.
+- The owner's open questions are 4, 8, 11 and 12 to 19 above (18 and 19 added on the
+  morning of 2026-11-20). 12 to 15 are built on their recommendations meanwhile, each
+  separable; nothing is built for 16 (an accessor kind in the embedding API) or 17
+  (machine-stack frames for calls between the tier's codes) until they are answered; 18 is
+  built in its conservative form (host-shared buffers keep today's test) and 19 keeps the
+  test.
 - A measurement lesson of the evening, in the plan's records of the getter and graph lines:
   a row with the tier OFF that moves by 0.2% to 0.3% on Djot after a change that touches no
   generated code is the conservative collector keeping a different set of objects because a
