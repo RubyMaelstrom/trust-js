@@ -885,8 +885,11 @@ second unscheduled reboot. Where an older section differs, this one holds.
   (a first run was stopped by the guard at 3,302 passed when a second GPU batch started
   at 04:44; this is its rerun after the machine cleared, ended 05:27). The default configuration is
   unchanged: the tier is off unless TRUST_JS_OPT=1.
-- origin/main is still 6496547c. Local main is about 160 commits ahead and NOT PUSHED: the
-  whole of stage 3 since 2026-11-18 exists only on this machine's disk.
+- PUSHED on the owner's word at 05:52 on 2026-11-20: origin/main is b9037fe0 (it was
+  6496547c), plus the commit that records this. A fresh clone now has stage 3 through
+  this section. The five lines' branches named below are NOT pushed: they exist only in
+  the coordinator's checkout on the machine called Crystal, each in its worktree under
+  target/p3/stage3/.
 - NO AGENT IS RUNNING. Five lines were in flight; each stands on its branch with its
   brief (target/p3/stage3/briefs/), its evidence directory's STATUS.txt and NEXT.txt, and
   what resuming takes:
