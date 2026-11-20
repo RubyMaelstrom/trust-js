@@ -8680,3 +8680,17 @@ coordinator's check target/p3/stage3/c-review).
   main then had; the verifier sweep clean; the x86-64 host's three checks 0. On the merged
   main the node's tests, instanceof's and the two repaired generic-node tests pass with the
   tier on (20 of 20).
+
+x86-64's template measured against ARM64's, and a piece NOT built there (2026-11-20;
+target/p3/stage3/getter-impl/x64/gap.txt, note.txt). The getter line was to give x86-64 the
+in-line form of a typed array's length that ARM64 has (bbb86d40). Its premise was wrong: the
+x86-64 template has no accessor landing to put it in (its named reads have own-data ways
+only and the operand form is a bare helper call), and an iteration of the line's micro with
+nothing but the loop costs 592 instructions there against about 35 on ARM64. The piece was
+predicted at 6% to 7% of GBEMU and would have been x86-64's first chain walk, first shared
+stub and first in-line getter; it was stopped and the gap measured instead: with the tier
+off, x86-64 runs Octane at a geometric mean of 4.9 times ARM64's user instructions
+(Navier-Stokes 42.6, Crypto 38.1, zlib 13.8, Mandreel 7.6; the least about 2.1) and the
+fixtures at 3.2 to 3.7; Code-Load reads the same on both. In the worst four, 83% to 92% of
+the instructions are in helpers: operations handed to the VM one at a time, arithmetic, and
+element access. What follows is the owner's (the handoff note's question 20).

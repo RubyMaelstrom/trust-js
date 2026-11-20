@@ -300,6 +300,31 @@ Each is recorded where the plan line says; none blocks the lines above.
    the audit as a piece of its own when the pieces before it have landed and its share is
    measured, not inferred.
 
+20. From the getter line (2026-11-20; target/p3/stage3/getter-impl/x64/gap.txt and note.txt):
+   x86-64's TEMPLATE. x86-64 has no optimizing tier, and its template is far behind
+   ARM64's: with the tier off on both machines at the same revision (user instructions, 5
+   fixed runs; Code-Load, which runs almost no hot generated code, reads 0.432G on both, so
+   the same Rust code counts about the same and a ratio is the template's), x86-64 runs
+   Octane at a geometric mean of 4.9 times ARM64's instructions and the three fixtures at
+   3.2 (first passes) and 3.7 (steady states). The worst: Navier-Stokes 42.6 times, Crypto
+   38.1, zlib 13.8, Mandreel 7.6, GBEMU 5.7, React 5.2 to 5.6; the best about 2.1 to 3
+   (Splay, RegExp, Djot, Vue, Earley-Boyer). In the four worst 83% to 92% of x86-64's
+   instructions are in Rust helpers, the same three each time: operations with no in-line
+   form handed to the VM one at a time (jit_exec, 25% to 39%), arithmetic through a helper
+   (jit_bin_i32, jit_bin_num), and element access through a helper. Its named reads have
+   own-data ways only: no chain walk, no accessor landing, no shared stubs. The piece that
+   raised this (a typed array's length in line, ARM64's bbb86d40) would have been x86-64's
+   first of each of those for 6% to 7% of GBEMU, so it was not built. The question: does
+   x86-64's template get its own program now (in-line arithmetic and element access, the
+   operations still handed to the VM, the ways' chain walk and shared stubs, built and
+   counted on the x86-64 machine, in parallel with the ARM64 tier), or does it stay as it
+   is until the ARM64 tier's stage ends? Recommended: its own line now, starting with a
+   count and a design note (what ARM64's template has in line that x86-64's lacks, ordered
+   by what each carries in that table, and how much of the two templates can share one
+   emitter), since x86-64 is where most desktops are and the gap is in the default
+   configuration there; nothing is built for it until answered. Not measured: x86-64
+   times, Windows, and the gap to ARM64 with the tier on, which is larger.
+
 ## How the work is done
 
 - A design record before code. Each stage and each step that makes a choice has a note in the plan
@@ -735,8 +760,8 @@ Read this section before "2026-11-19, 18:00": where they differ, this one holds.
      a monomorphic call the tier does not inline calls its callee's current entry through
      a word the chunk keeps; a function folded from a global is a known callee with no
      guard (263.5M of Mandreel's 351.6M such calls at 200 runs).
-- The owner's open questions are 4, 8, 11 and 12 to 19 above (18 and 19 added on the
-  morning of 2026-11-20). 12 to 15 are built on their recommendations meanwhile, each
+- The owner's open questions are 4, 8, 11 and 12 to 20 above (18 to 20 added on the
+  morning of 2026-11-20; 20, x86-64's template, has nothing built for it). 12 to 15 are built on their recommendations meanwhile, each
   separable; nothing is built for 16 (an accessor kind in the embedding API) or 17
   (machine-stack frames for calls between the tier's codes) until they are answered; 18 is
   built in its conservative form (host-shared buffers keep today's test) and 19 keeps the
