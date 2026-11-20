@@ -1489,7 +1489,10 @@ fn both_poisoned(source: &str, exit_every: u32, stress: bool, poison: bool) -> (
 /// generic named loads through `this`, a local and the stack, stores and an update through
 /// setters, element reads by name, instanceof, template strings, array literals, loose equality,
 /// string concatenation, delete), each through accessors or megamorphic sites so that it stays
-/// a generic node.
+/// a generic node. `isM`'s instanceof stays one because M has an own Symbol.hasInstance, which
+/// no cell fills for (`Interp::instanceof_ic` fills for a constructor with none of its own, and
+/// `Rules::instance_of` lowers a filled cell alone: P3 stage 3, graph piece 3); `isN`'s, on a
+/// plain constructor, is lowered in its inlined frame.
 const GENERIC_KINDS: &str = "
 var shapes = [{a: 1, x: 1}, {b: 1, x: 2}, {c: 1, x: 3}, {d: 1, x: 4}, {e: 1, x: 5}, {f: 1, x: 6}];
 function gx(o) { return o.x; }
@@ -1502,7 +1505,10 @@ M.prototype.rw = function () { return this.w; };
 M.prototype.ww = function (z) { this.w = z; };
 function sw(o, z) { o.w = z; }
 function at(o, k) { return o[k]; }
+Object.defineProperty(M, Symbol.hasInstance, { value: function (o) { return o.v !== undefined; } });
+function N() {}
 function isM(o) { return o instanceof M; }
+function isN(o) { return o instanceof N; }
 function str(v) { return `${v}!`; }
 function arr(a, b) { return [a, b]; }
 function loc(o) { var q = o; return q.w; }
@@ -1519,6 +1525,7 @@ function run(n) {
     s += m.rw(); m.ww(i); sw(m, i + 1);
     s += at(m, i & 1 ? 'v' : 'w');
     if (isM(m)) s++;
+    if (isN(m)) s--;
     t = str(i) + cat('a', i);
     s += arr(i, 2).length + loc(m);
     sloc(m, 3);
@@ -1767,6 +1774,14 @@ fn generic_operations_of_inlined_callees_give_the_tier_offs_results() {
     ] {
         assert!(ops.iter().any(kind), "{ops:?}");
     }
+    // Both forms of instanceof in an inlined frame: `isM`'s is among the generic nodes above,
+    // and `isN`'s plain constructor is built as the walk.
+    let mut engine = warmed(GENERIC_KINDS);
+    let built = Compile::new(&mut engine, "run").build();
+    let walks = nodes(&built.graph, |node| {
+        node.frame != FrameIx(0) && matches!(node.op, NodeOp::HasInPrototypeChain)
+    });
+    assert_eq!(walks.len(), 1, "isN's walk: {}", dump(&built.graph));
 }
 
 #[test]
@@ -4959,6 +4974,10 @@ fn a_slot_window_is_scanned_at_its_nodes_end_poll_on_a_rust_entry() {
 /// Symbol.hasInstance through `isP`'s InstanceOf, a valueOf through `add`'s Add, a toString
 /// through `ts`'s ToStr, a Proxy's `get` through `callAt`'s GetMethodElem, and `mk2`'s literals.
 /// Every receiver differs from the one before it, so that a stale receiver word shows.
+/// `isP`'s site sees two constructors of two shapes (P, and Q with an own `extra`), so that its
+/// cell is marked generic (`Interp::instanceof_ic`: a right-hand side of another shape marks a
+/// filled cell) and `Rules::instance_of`, which takes no marked cell, leaves it a generic node
+/// (P3 stage 3, graph piece 3); `isQ`'s site sees Q alone and is lowered in its inlined frame.
 const EXPLICIT_INPUTS: &str = "
 var probe = false, log = [];
 function stk(e) { return e.stack.split('\\n').slice(1, 4).join('/'); }
@@ -4968,7 +4987,10 @@ P.prototype.sx = function sx(v) { this.x = v; };
 function lx(o) { return o.x; }
 function setL(o, v) { o.x = v; }
 function setE(a, i, v) { a[i] = v; }
+function Q() {}
+Q.extra = 1;
 function isP(o, C) { return o instanceof C; }
+function isQ(o) { return o instanceof Q; }
 function add(a, b) { return a + b; }
 function ts(x) { return `<${x}>`; }
 function callAt(o, k) { return o[k](); }
@@ -4987,6 +5009,7 @@ function hotThis(arr) { var t = 0; for (var i = 0; i < arr.length; i++) { t += a
 function hotLocal(arr) { var t = 0; for (var i = 0; i < arr.length; i++) { t += lx(arr[i]); setL(arr[i], i + t); } return t; }
 function hotElem(as) { for (var i = 0; i < as.length; i++) setE(as[i], i & 3, i); return as.length; }
 function hotIs(arr, C) { var t = 0; for (var i = 0; i < arr.length; i++) if (isP(arr[i], C)) t++; return t; }
+function hotQ(arr) { var t = 0; for (var i = 0; i < arr.length; i++) if (isQ(arr[i])) t++; return t; }
 function hotAdd(as, bs) { var r = []; for (var i = 0; i < as.length; i++) r.push(add(as[i], bs[i])); return r.join(','); }
 function hotTs(as) { var r = ''; for (var i = 0; i < as.length; i++) r += ts(as[i]); return r; }
 function hotCall(os, ks) { var t = 0; for (var i = 0; i < os.length; i++) t += callAt(os[i], ks[i]); return t; }
@@ -4994,7 +5017,7 @@ function hotMk(n) { var t = 0; for (var i = 0; i < n; i++) t += mk2(i).q.length;
 var r = 0;
 for (var k = 0; k < 300; k++) {
   r += hotThis(objs) + hotLocal(objs) + hotElem(arrs) + hotIs(objs, P) + hotAdd(xs, ys).length
-    + hotTs(xs).length + hotCall(callees, keys) + hotMk(4);
+    + hotTs(xs).length + hotCall(callees, keys) + hotMk(4) + hotIs(objs, Q) + hotQ(objs);
   for (var j = 0; j < objs.length; j++) objs[j].x = j;
 }
 probe = true;
@@ -5082,6 +5105,16 @@ fn explicit_input_kinds_give_their_helpers_the_frames_receiver_chunk_and_site() 
         ),
     ] {
         assert!(kind, "{name} inlined as a generic node: {ops:?}");
+    }
+    // Both forms of instanceof in an inlined frame: `isP`'s marked site is the generic node
+    // above (no walk built for it), and `isQ`'s plain constructor is built as the walk.
+    let mut engine = warmed(EXPLICIT_INPUTS);
+    for (name, lowered) in [("hotIs", 0), ("hotQ", 1)] {
+        let built = Compile::new(&mut engine, name).build();
+        let walks = nodes(&built.graph, |node| {
+            node.frame != FrameIx(0) && matches!(node.op, NodeOp::HasInPrototypeChain)
+        });
+        assert_eq!(walks.len(), lowered, "{name}: {}", dump(&built.graph));
     }
     // Collections at every allocation over a shorter warm-up (the debug build's time limit;
     // every site still runs its generic node from the code before the probes).
